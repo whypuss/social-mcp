@@ -1,1 +1,1 @@
-"""Meta Social MCP — Chrome CDP + Facebook Graph API"""
+"""Meta Social MCP — CDP Browser Hijacking for Facebook Personal Account"""

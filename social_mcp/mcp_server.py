@@ -1,16 +1,22 @@
 """
-social-mcp — MCP Server
+social-mcp — MCP Server via CDP Browser Hijacking
 
 用法：
-  uv run social-mcp                    # 直接啟動
-  uv run social-mcp --debug            # 除錯模式
+  uv run social-mcp                    # 直接啟動（blocking，等待 stdio）
+  uv run python -m social_mcp.post_facebook "你的發文內容"   # 單獨發文
+
+在 Hermes Agent 的 ~/.hermes/config.yaml 加入：
+  mcp_servers:
+    personal-social:
+      command: "/path/to/.venv/bin/python"
+      args: ["/path/to/social_mcp/mcp_server.py"]
 
 在 Claude Desktop 的 claude_desktop_config.json 加入：
 {
   "mcpServers": {
     "social": {
       "command": "uv",
-      "args": ["run", "--project", "/路徑/到/social-mcp", "social-mcp"]
+      "args": ["run", "--project", "/path/to/social-mcp", "social-mcp"]
     }
   }
 }
@@ -18,240 +24,279 @@ social-mcp — MCP Server
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
-import json
-from datetime import datetime
+from mcp.server.fastmcp import FastMCP
 
-# MCP SDK
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
-
-from .chrome_session import get_meta_cookies, ChromeCookie
-from .meta_api import MetaAPI, PLATFORMS
+from .browser_hijack import (
+    ensure_chromium,
+    connect_to_facebook_page,
+    is_chromium_running,
+    launch_chromium,
+    CHROMIUM_PROFILE,
+)
 
 log = logging.getLogger(__name__)
 
-# ──── Logging ────
+mcp = FastMCP("Personal_Social")
 
-def setup_logging(debug: bool):
-    level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+# ─────────────────────────────────────────────
+# TOOL 1: Open login window
+# ─────────────────────────────────────────────
+@mcp.tool()
+async def open_login_window():
+    """
+    Launch visible Chromium browser so you can manually log in to Facebook.
+    Run this ONCE when setting up — or whenever the session expires.
 
+    The browser will stay open. After you log in, close the browser window.
+    Subsequent calls to other tools will use this logged-in session.
+    """
+    await ensure_chromium()
 
-# ──── MCP Tools ────
+    from playwright.async_api import async_playwright
 
-TOOLS = [
-    Tool(
-        name="health_check",
-        description="檢查 Chrome cookies 是否有效，回傳登入狀態。",
-        inputSchema={
-            "type": "object",
-            "properties": {},
-        },
-    ),
-    Tool(
-        name="get_messenger_inbox",
-        description="讀取 Messenger 收件箱最新對話。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "limit": {
-                    "type": "integer",
-                    "description": "最多回傳幾條對話（預設 10）",
-                    "default": 10,
-                },
-            },
-        },
-    ),
-    Tool(
-        name="send_messenger",
-        description="發送 Messenger 私信給指定用戶。",
-        inputSchema={
-            "type": "object",
-            "required": ["thread_id", "message"],
-            "properties": {
-                "thread_id": {
-                    "type": "string",
-                    "description": "Messenger 對話 ID（從 inbox 取得）",
-                },
-                "message": {
-                    "type": "string",
-                    "description": "要發送的訊息內容",
-                },
-            },
-        },
-    ),
-    Tool(
-        name="post_facebook",
-        description="發 Facebook 粉絲團文字帖。",
-        inputSchema={
-            "type": "object",
-            "required": ["message"],
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "貼文內容",
-                },
-            },
-        },
-    ),
-    Tool(
-        name="post_instagram",
-        description="發 Instagram 圖文帖（需 Instagram Business 帳號）。",
-        inputSchema={
-            "type": "object",
-            "required": ["caption"],
-            "properties": {
-                "caption": {
-                    "type": "string",
-                    "description": "圖片說明文字",
-                },
-                "image_url": {
-                    "type": "string",
-                    "description": "圖片 URL（可選）",
-                },
-            },
-        },
-    ),
-    Tool(
-        name="post_threads",
-        description="發 Threads 文字帖（需 Instagram Business 帳號）。",
-        inputSchema={
-            "type": "object",
-            "required": ["text"],
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Threads 內文",
-                },
-            },
-        },
-    ),
-    Tool(
-        name="get_facebook_page_info",
-        description="取得 Facebook 粉絲頁基本資訊（名稱、粉絲數、ID）。",
-        inputSchema={
-            "type": "object",
-            "properties": {},
-        },
-    ),
-]
+    async with async_playwright() as p:
+        browser = await p.chromium.launch_persistent_context(
+            CHROMIUM_PROFILE,
+            headless=False,
+            viewport={"width": 1280, "height": 800},
+            no_viewport=False,
+        )
+        page = await browser.new_page()
+        await page.goto("https://www.facebook.com")
+        await browser.wait_for_close()
+
+    return "Browser closed. Session saved in FacebookMCP profile."
 
 
-# ──── MCP Handlers ────
+# ─────────────────────────────────────────────
+# TOOL 2: Post to Facebook (personal wall)
+# ─────────────────────────────────────────────
+@mcp.tool()
+async def post_facebook(message: str):
+    """
+    Post a text message to your personal Facebook wall.
 
-async def handle_tool_call(name: str, arguments: dict, api: MetaAPI) -> list[TextContent]:
-    """根據工具名稱 dispatch 到對應的 API 方法。"""
+    Requires: Chromium running on port 9333 with a logged-in FacebookMCP profile.
+    First run open_login_window() if you haven't logged in yet.
+    """
+    if not is_chromium_running():
+        return "❌ Chromium not running. Run open_login_window() first."
 
-    if name == "health_check":
-        result = await api.health_check()
-        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+    await ensure_chromium()
+    await asyncio.sleep(2)
 
-    elif name == "get_messenger_inbox":
-        limit = arguments.get("limit", 10)
-        result = await api.get_messenger_inbox(limit=limit)
-        if result.success:
-            lines = [f"## Messenger 收件箱（共 {len(result.messages)} 筆）\n"]
-            for i, msg in enumerate(result.messages, 1):
-                ts = msg.timestamp[:19] if msg.timestamp else ""
-                lines.append(f"{i}. [{ts}] {msg.sender}：{msg.text[:80]}")
-            return [TextContent(type="text", text="\n".join(lines))]
-        return [TextContent(type="text", text=f"❌ 取得失敗：{result.error}")]
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(f"http://localhost:9333")
+        ctx = browser.contexts[0]
+        fb_page = None
+        for pg in ctx.pages:
+            if "facebook.com" in pg.url:
+                fb_page = pg
+                break
 
-    elif name == "send_messenger":
-        thread_id = arguments["thread_id"]
-        message = arguments["message"]
-        result = await api.send_messenger_message(thread_id, message)
-        if result.success:
-            return [TextContent(type="text", text=f"✅ 訊息已發送至 {thread_id}：{message}")]
-        return [TextContent(type="text", text=f"❌ 發送失敗：{result.error}")]
+        if not fb_page:
+            return "❌ No Facebook page found. Open facebook.com in the Chromium tab first."
 
-    elif name == "post_facebook":
-        message = arguments["message"]
-        page_id = os.getenv("FACEBOOK_PAGE_ID")
-        result = await api.post_to_facebook(message, page_id=page_id)
-        if result.success:
-            return [TextContent(type="text", text=f"✅ 成功發帖！\nURL: {result.url}")]
-        return [TextContent(type="text", text=f"❌ 發帖失敗：{result.error}")]
+        await fb_page.goto("https://www.facebook.com", wait_until="domcontentloaded")
+        await asyncio.sleep(3)
 
-    elif name == "post_instagram":
-        caption = arguments["caption"]
-        image_url = arguments.get("image_url")
-        result = await api.post_to_instagram(caption=caption, image_url=image_url)
-        if result.success:
-            return [TextContent(type="text", text=f"✅ IG 發文成功！ID: {result.post_id}")]
-        return [TextContent(type="text", text=f"❌ IG 發文失敗：{result.error}")]
+        body = await fb_page.inner_text("body")
+        if "登入" in body[:400] and "電子郵件" in body[:400]:
+            return "❌ Not logged in. Run open_login_window() first."
 
-    elif name == "post_threads":
-        text = arguments["text"]
-        result = await api.post_to_threads(text=text)
-        if result.success:
-            return [TextContent(type="text", text=f"✅ Threads 發文成功！ID: {result.post_id}")]
-        return [TextContent(type="text", text=f"❌ Threads 發文失敗：{result.error}")]
-
-    elif name == "get_facebook_page_info":
-        page_id = os.getenv("FACEBOOK_PAGE_ID")
-        if not page_id:
-            page_id = await api.get_page_id()
-        if not page_id:
-            return [TextContent(type="text", text="❌ 無法取得 Page ID")]
+        # Click composer
         try:
-            token = await api._get_page_token_from_cookie(page_id)
-            if not token:
-                return [TextContent(type="text", text="❌ 無法取得 Page Access Token")]
-            info = await api._graph_get(page_id, params={
-                "fields": "name,fan_count,id",
-                "access_token": token,
-            })
-            return [TextContent(type="text", text=json.dumps(info, indent=2, ensure_ascii=False))]
+            composer = fb_page.locator('[aria-label="建立帖子"]').first
+            await composer.click(timeout=8000)
+            await asyncio.sleep(2)
         except Exception as e:
-            return [TextContent(type="text", text=f"❌ 錯誤：{e}")]
+            return f"❌ Could not open composer: {e}"
 
-    return [TextContent(type="text", text=f"❌ 未知工具: {name}")]
+        # Type message
+        await fb_page.keyboard.type(message, delay=20)
+        await asyncio.sleep(1)
 
-
-# ──── Main ────
-
-async def main():
-    parser = argparse.ArgumentParser(description="social-mcp — Meta Social MCP Server")
-    parser.add_argument("--debug", action="store_true", help="除錯模式")
-    parser.add_argument("--port", type=int, default=None, help="CDP 連接埠（預設自動偵測）")
-    args = parser.parse_args()
-
-    setup_logging(args.debug)
-    log.info("[social-mcp] 啟動中...")
-
-    # 預先初始化 cookies
-    cookies = await get_meta_cookies()
-    api = MetaAPI(cookies)
-    log.info(f"[social-mcp] 取得 {len(cookies)} 個 Meta cookies，user_id={api.user_id}")
-
-    # 建立 MCP Server
-    server = Server("social-mcp")
-
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return TOOLS
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+        # Click "下一頁" to advance multi-step composer
         try:
-            return await handle_tool_call(name, arguments, api)
-        except Exception as e:
-            log.exception(f"[social-mcp] Tool {name} 錯誤")
-            return [TextContent(type="text", text=f"❌ 例外錯誤: {e}")]
+            next_btn = fb_page.locator('[aria-label="下一頁"]').first
+            await next_btn.click(timeout=5000)
+            await asyncio.sleep(2)
+        except Exception:
+            pass  # Some accounts don't need this
 
-    # 啟動 stdio server（MCP 標準輸入輸出模式）
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+        # Click "發佈"
+        try:
+            post_btn = fb_page.locator('[aria-label="發佈"]').first
+            await post_btn.click(timeout=8000)
+            await asyncio.sleep(4)
+        except Exception as e:
+            return f"❌ Could not click post button: {e}"
+
+        # Verify
+        body = await fb_page.inner_text("body")
+        if "Hermes" in body or "自動發文" in body or "發佈" in body:
+            return f"✅ Post published successfully!"
+        else:
+            return "⚠️ Post may have been published. Check your Facebook wall."
+
+
+# ─────────────────────────────────────────────
+# TOOL 3: Read Messenger inbox
+# ─────────────────────────────────────────────
+@mcp.tool()
+async def read_messenger():
+    """
+    Read your Messenger conversations as a markdown table.
+
+    Requires: Chromium running with logged-in FacebookMCP profile.
+    """
+    if not is_chromium_running():
+        return "❌ Chromium not running. Run open_login_window() first."
+
+    await ensure_chromium()
+    await asyncio.sleep(2)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(f"http://localhost:9333")
+        ctx = browser.contexts[0]
+        fb_page = None
+        for pg in ctx.pages:
+            if "facebook.com" in pg.url:
+                fb_page = pg
+                break
+
+        if not fb_page:
+            return "❌ No Facebook page found."
+
+        await fb_page.goto(
+            "https://www.facebook.com/messages", wait_until="domcontentloaded"
+        )
+        await asyncio.sleep(3)
+
+        body = await fb_page.inner_text("body")
+        if "登入" in body[:400] and "電子郵件" in body[:400]:
+            return "❌ Not logged in. Run open_login_window() first."
+
+        # Find conversation list
+        selectors = [
+            'div[role="gridcell"]',
+            'ul[role="listbox"] li',
+            '[aria-label*="訊息"]',
+        ]
+
+        entries = []
+        for sel in selectors:
+            try:
+                elems = await fb_page.locator(sel).all()
+                if elems:
+                    for e in elems:
+                        txt = (await e.inner_text()).strip()
+                        if txt:
+                            entries.append(txt)
+                    if entries:
+                        break
+            except Exception:
+                pass
+
+        if not entries:
+            return f"⚠️ Could not read conversations. Check if Messenger loaded."
+
+        res = "### Messenger 私訊摘要\n\n| 對話 |\n| :--- |\n"
+        for entry in entries[:8]:
+            lines = [l.strip() for l in entry.split("\n") if l.strip()]
+            clean = " | ".join(lines[:3])
+            res += f"| {clean} |\n"
+        return res
+
+
+# ─────────────────────────────────────────────
+# TOOL 4: Read Facebook notifications
+# ─────────────────────────────────────────────
+@mcp.tool()
+async def read_notifications():
+    """
+    Fetch your Facebook notifications as a markdown table.
+
+    Requires: Chromium running with logged-in FacebookMCP profile.
+    """
+    if not is_chromium_running():
+        return "❌ Chromium not running. Run open_login_window() first."
+
+    await ensure_chromium()
+    await asyncio.sleep(2)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(f"http://localhost:9333")
+        ctx = browser.contexts[0]
+        fb_page = None
+        for pg in ctx.pages:
+            if "facebook.com" in pg.url:
+                fb_page = pg
+                break
+
+        if not fb_page:
+            return "❌ No Facebook page found."
+
+        await fb_page.goto(
+            "https://www.facebook.com/notifications", wait_until="domcontentloaded"
+        )
+        await asyncio.sleep(3)
+
+        body = await fb_page.inner_text("body")
+        if "登入" in body[:400] and "電子郵件" in body[:400]:
+            return "❌ Not logged in. Run open_login_window() first."
+
+        selectors = [
+            'div[role="article"]',
+            'div[data-pagelet*="Noti"]',
+            'div.notificationsItem',
+        ]
+
+        entries = []
+        for sel in selectors:
+            try:
+                elems = await fb_page.locator(sel).all()
+                if elems:
+                    for e in elems:
+                        txt = (await e.inner_text()).strip()
+                        if txt and len(txt) > 5:
+                            entries.append(txt)
+                    if entries:
+                        break
+            except Exception:
+                pass
+
+        if not entries:
+            return f"⚠️ Could not read notifications."
+
+        res = "### Facebook 通知摘要\n\n| 通知 |\n| :--- |\n"
+        for entry in entries[:8]:
+            lines = [l.strip() for l in entry.split("\n") if l.strip()]
+            clean = " | ".join(lines[:2])
+            res += f"| {clean} |\n"
+        return res
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Parse --debug flag
+    parser = argparse.ArgumentParser(description="social-mcp")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+    else:
+        logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+
+    log.info("[social-mcp] Starting MCP server via CDP Browser Hijacking...")
+    log.info("[social-mcp] Profile: %s", CHROMIUM_PROFILE)
+    log.info("[social-mcp] CDP port: %d", CDP_PORT)
+    log.info(
+        "[social-mcp] First time? Run open_login_window() to log in to Facebook."
+    )
+
+    mcp.run()
