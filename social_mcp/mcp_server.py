@@ -1,5 +1,5 @@
 """
-social-mcp — MCP Server via CDP Browser Hijacking
+Meta Workflow — MCP Server via CDP Browser Hijacking
 
 用法：
   uv run social-mcp                    # 直接啟動（blocking，等待 stdio）
@@ -292,11 +292,11 @@ if __name__ == "__main__":
     else:
         logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-    log.info("[social-mcp] Starting MCP server via CDP Browser Hijacking...")
-    log.info("[social-mcp] Profile: %s", CHROMIUM_PROFILE)
-    log.info("[social-mcp] CDP port: %d", CDP_PORT)
+    log.info("[meta-workflow] Starting MCP server via CDP Browser Hijacking...")
+    log.info("[meta-workflow] Profile: %s", CHROMIUM_PROFILE)
+    log.info("[meta-workflow] CDP port: %d", CDP_PORT)
     log.info(
-        "[social-mcp] First time? Run open_login_window() to log in to Facebook."
+        "[meta-workflow] First time? Run open_login_window() to log in to Facebook."
     )
 
     mcp.run()

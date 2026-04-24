@@ -1,7 +1,7 @@
 [project]
 name = "social-mcp"
 version = "0.1.0"
-description = "Meta Social MCP — 操作 Facebook / Instagram / Threads，透過 Chrome CDP 讀取本地 cookies"
+description = "Meta Workflow — 操作 Facebook / Instagram / Threads，透過 Chrome CDP 讀取本地 cookies"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

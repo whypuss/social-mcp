@@ -1,4 +1,4 @@
-# social-mcp
+# Meta Workflow
 
 > 用 CDP Browser Hijacking 直接操作 Facebook 個人帳號——不需要 API Token、不需要開發者帳號。
 
