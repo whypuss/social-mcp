@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""
+post_threads — CLI for CDP+Playwright Threads posting
+
+Usage:
+    python scripts/post_threads "你的訊息"
+    python scripts/post_threads "你的訊息" --image /path/to/image.jpg
+    python scripts/post_threads --verify  # wait for confirmation
+    python scripts/post_threads --no-verify  # skip verification
+"""
+import argparse
+import asyncio
+import os
+import sys
+
+# Ensure the package is importable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from social_mcp.post_threads import post_threads
+from social_mcp.browser_hijack import is_chromium_running
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Post to Threads via CDP+Playwright")
+    parser.add_argument("message", nargs="?", default="🤖 CDP+Playwright 混合方案測試 from Hermes Agent")
+    parser.add_argument("--image", "-i", default=None, help="Path to image file (JPG/PNG/WebP)")
+    parser.add_argument("--verify", action="store_true", help="Wait for verification (slower)")
+    parser.add_argument("--no-verify", action="store_true", help="Skip verification (faster)")
+    args = parser.parse_args()
+
+    if not is_chromium_running():
+        print("❌ Chromium not running.")
+        print("   Start it with: open -a Chromium --args --remote-debugging-port=9333")
+        sys.exit(1)
+
+    wait_verify = not args.no_verify
+    result = asyncio.run(post_threads(args.message, image_path=args.image, wait_verify=wait_verify))
+    print(result)
+
+
+if __name__ == "__main__":
+    main()

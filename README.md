@@ -17,6 +17,7 @@
 | `post_facebook` | 在個人動態牆發布文字帖 | ✅ 實測成功 |
 | `read_messenger` | 讀取 Messenger 私訊對話列表 | ✅ |
 | `read_notifications` | 讀取 Facebook 通知 | ✅ |
+| `post_threads` | 在 Threads 個人檔案發布文字+圖片帖 | ✅ 實測成功 |
 
 ## 原理
 
@@ -180,7 +181,51 @@ A: Facebook 有時會要求重新驗證裝置。若操作失敗，重新在 CDP 
 A: 目前主要支援個人帳號。粉絲專頁操作（以粉絲團身份發文）需要切換到粉絲團身份，Facebook 頁面元件稍有不同，可能需要調整 DOM selector。
 
 **Q: 支援 Instagram / Threads 嗎？**
-A: 理論上可行，原理相同，但需要針對 IG/Threads 的 DOM 調整 selector。歡迎 PR。
+A: ✅ Threads 支援已實測成功！見下方「Threads 發文」章節。Instagram 尚未測試。
+
+## Threads 發文
+
+Threads 使用和 Facebook 相同的 CDP Browser Hijacking 架構。Chromium 登入 Facebook 後，Threads 同步登入，無需另外設定。
+
+### 直接測試文字帖
+
+```bash
+uv run python scripts/post_threads "測試訊息 from AI Agent 🚀"
+```
+
+### 帶圖片發文
+
+```bash
+uv run python scripts/post_threads "Windows 11 SSD 速度問題" --image /tmp/ssd.jpg
+```
+
+### Python API
+
+```python
+from social_mcp.post_threads import post_threads
+
+# 純文字
+result = await post_threads("測試文字帖")
+
+# 圖文並茂
+result = await post_threads(
+    message="Windows 11 升級後 SSD 速度跌至 1/4？",
+    image_path="/tmp/ssd.jpg"
+)
+print(result)  # ✅ Posted to Threads in 9.2s
+```
+
+### Threads 發文原理（與 Facebook 的差異）
+
+| 步驟 | Facebook | Threads |
+|------|----------|---------|
+| 開啟 composer | `aria-label=" 建立帖子 "` | `aria-label=" 文字欄位空白。請輸入內容以撰寫新貼文。 "` |
+| 編輯器 | 標準 `contenteditable` | Lexical `data-lexical-editor` |
+| 發布按鈕 | 直接在頁面 DOM | 在 `role="dialog"` 內（含「發佈」文字） |
+| 圖片上傳 | 點擊按鈕 → OS 文件選擇 | 找 dialog 內 `input[type="file"]` → `set_input_files()` |
+| 發布後行為 | Dialog 關閉 | Dialog 關閉，**留在 profile 頁面不跳轉** |
+
+**驗證方式**：發布後 reload profile 頁面，從 DOM 中確認內容出現。
 
 ## 安全性說明
 
@@ -209,7 +254,8 @@ social_mcp/
 ├── __init__.py          # 套件起點
 ├── browser_hijack.py    # CDP 瀏覽器接管核心
 ├── mcp_server.py        # MCP Server（stdio 模式）
-└── post_facebook.py     # 獨立發文腳本
+├── post_facebook.py     # Facebook 發文腳本
+└── post_threads.py      # Threads 發文腳本（支援圖文）
 ```
 
 ## 授權
