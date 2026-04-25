@@ -119,26 +119,55 @@ async def post_threads(message: str, image_path: Optional[str] = None, wait_veri
             await asyncio.sleep(0.3)
 
             # ── Step 1: Open composer ─────────────────────────────────────────
-            # CRITICAL: Must use page.evaluate() to click, NOT locator.click(force=True).
-            # force=True dispatches raw mouse events but bypasses React synthetic handlers,
-            # so the dialog never actually opens. page.evaluate() runs in the same JS context
-            # and properly triggers React's onClick.
+            # On profile pages, the composer is hidden — need to click "建立" first.
+            # On main feed, "文字欄位空白" is visible immediately.
             try:
                 click_result = await threads_page.evaluate("""
                     () => {
+                        // First check if composer is already open
                         const els = document.querySelectorAll("[aria-label]");
                         for (const el of els) {
                             if (el.getAttribute("aria-label").includes("文字欄位空白")) {
-                                el.click(); return "clicked";
+                                el.click(); return "composer-clicked";
                             }
+                        }
+                        // Composer not open — click "建立" button
+                        for (const svg of document.querySelectorAll('svg[aria-label="建立"]')) {
+                            const parent = svg.parentElement;
+                            if (parent) { parent.click(); return "establish-clicked"; }
+                            const gp = parent?.parentElement;
+                            if (gp) { gp.click(); return "establish-clicked-gp"; }
                         }
                         return "not found";
                     }
                 """)
                 if click_result == "not found":
                     return "❌ Composer area not found"
+                print(f"[Threads] Step 1: {click_result}")
             except Exception as e:
                 return f"❌ Cannot open composer: {e}"
+
+            # Wait for dialog to open (if we clicked 建立)
+            await asyncio.sleep(2)
+
+            # Now click the actual composer textarea
+            try:
+                composer_result = await threads_page.evaluate("""
+                    () => {
+                        const els = document.querySelectorAll("[aria-label]");
+                        for (const el of els) {
+                            if (el.getAttribute("aria-label").includes("文字欄位空白")) {
+                                el.click(); return "composer-clicked";
+                            }
+                        }
+                        return "not found";
+                    }
+                """)
+                if composer_result == "not found":
+                    return "❌ Composer textarea not found"
+                print(f"[Threads] Step 1b: {composer_result}")
+            except Exception as e:
+                return f"❌ Cannot click composer: {e}"
 
             await asyncio.sleep(0.3)
 
