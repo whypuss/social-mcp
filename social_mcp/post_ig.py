@@ -216,16 +216,16 @@ async def post_ig(caption: str, image_path: str) -> str:
             print("[IG]   等待發布...")
             await asyncio.sleep(8)
 
-            # ── Step 6: 點「完成」 ──────────────────────
+            # ── Step 6: 點「完成」（非阻塞，dialog 可能已自動關閉）────────
             print("[IG] Step 6: 點擊「完成」")
             try:
+                # 先等最多 5 秒，超時就跳過（IG 發文後 dialog 常自動關閉）
                 done_btn = ig.get_by_text("完成", exact=True).first
-                await done_btn.focus()
-                await asyncio.sleep(0.3)
+                await done_btn.wait_for(timeout=5000)
                 await done_btn.press("Enter")
                 print("[IG]   完成: pressed Enter")
             except Exception as e:
-                print(f"[IG]   完成 not found (may have auto-closed): {e}")
+                print(f"[IG]   完成 (auto-closed or not shown, skipping): {e}")
 
             await asyncio.sleep(2)
             await browser.close()
