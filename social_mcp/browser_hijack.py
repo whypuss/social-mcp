@@ -33,46 +33,63 @@ log = logging.getLogger(__name__)
 # ungoogled-chromium 預設路徑
 CHROMIUM_PATH = "/Applications/Chromium.app/Contents/MacOS/Chromium"
 CHROMIUM_PROFILE = os.path.expanduser("~/Library/Application Support/Chromium/FacebookMCP")
-CDP_PORT = 9333
-CDP_WS_BASE = f"ws://localhost:{CDP_PORT}"
+
+# 支援多個 CDP 端口，自動選擇已登入的那個
+CDP_PORTS = [9333, 9222]
+
+
+def _get_active_port() -> Optional[int]:
+    """Return the first CDP port that has a running Chromium, or None."""
+    for port in CDP_PORTS:
+        try:
+            req = urllib.request.Request(
+                f"http://localhost:{port}/json/version",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=3) as r:
+                if r.status == 200:
+                    log.info(f"[BrowserHijack] Active CDP port: {port}")
+                    return port
+        except Exception:
+            pass
+    return None
 
 
 def find_chromium_ws() -> Optional[str]:
-    """Find the WebSocket URL for the first Chrome tab."""
-    try:
-        req = urllib.request.Request(
-            f"http://localhost:{CDP_PORT}/json",
-            headers={"User-Agent": "Mozilla/5.0 Chrome-CDP-Client"}
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            tabs = json.loads(resp.read())
-            for tab in tabs:
-                if tab.get("type") == "page":
-                    return tab.get("webSocketDebuggerUrl")
-            if tabs:
-                return tabs[0].get("webSocketDebuggerUrl")
-    except Exception as e:
-        log.warning(f"Cannot find Chromium WS: {e}")
+    """Find the WebSocket URL for the first Chrome tab on any active CDP port."""
+    for port in CDP_PORTS:
+        try:
+            req = urllib.request.Request(
+                f"http://localhost:{port}/json",
+                headers={"User-Agent": "Mozilla/5.0 Chrome-CDP-Client"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                tabs = json.loads(resp.read())
+                for tab in tabs:
+                    if tab.get("type") == "page":
+                        return tab.get("webSocketDebuggerUrl")
+                if tabs:
+                    return tabs[0].get("webSocketDebuggerUrl")
+        except Exception:
+            pass
     return None
 
 
 def is_chromium_running() -> bool:
-    """Check if Chromium is already running with CDP."""
-    try:
-        req = urllib.request.Request(
-            f"http://localhost:{CDP_PORT}/json/version",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        with urllib.request.urlopen(req, timeout=3) as r:
-            return r.status == 200
-    except Exception:
-        return False
+    """Check if Chromium is already running on any CDP port."""
+    return _get_active_port() is not None
+
+
+def get_active_cdp_port() -> int:
+    """Return the active CDP port, or first port as default."""
+    return _get_active_port() or CDP_PORTS[0]
 
 
 def launch_chromium() -> Optional[int]:
     """Launch ungoogled-chromium with remote debugging. Returns PID or None."""
-    if is_chromium_running():
-        log.info("[BrowserHijack] Chromium already running on port 9333")
+    port = _get_active_port()
+    if port:
+        log.info(f"[BrowserHijack] Chromium already running on port {port}")
         return None
 
     # Clear singleton locks that might prevent launch
@@ -114,8 +131,7 @@ def launch_chromium() -> Optional[int]:
 async def connect_to_facebook_page() -> Optional:
     """
     Connect to the running Chromium and return the Facebook page CDP connection.
-    Requires Chromium to be running with --remote-debugging-port=9333
-    and a logged-in Facebook session in the FacebookMCP profile.
+    Automatically uses whichever port has an active Chromium session.
     """
     ws_url = find_chromium_ws()
     if not ws_url:

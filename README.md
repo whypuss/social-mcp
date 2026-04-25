@@ -1,54 +1,42 @@
-# Meta Workflow
+# social-mcp
 
-> 用 CDP Browser Hijacking 直接操作 Facebook 個人帳號——不需要 API Token、不需要開發者帳號。
+> 用 CDP Browser Hijacking 操作主流社交平台——不需要 API Token，不需要開發者帳號。
 
-用你自己的 Chromium 瀏覽器 session，AI Agent 透過 CDP 接管來發文、讀私訊、讀通知。
+透過你自己瀏覽器的登入 session，AI Agent 用 CDP 接管來發文、爬蟲、對話。
 
-## 2026-04-24 實測：成功在 Facebook 個人牆發文
+## 2026-04-25 實測成果
 
-![post result](https://img.shields.io/badge/Status-Working-brightgreen)
-![platform](https://img.shields.io/badge/Platform-Facebook%20Personal%20Account-blue)
-
-## 功能
-
-| 工具 | 說明 | 狀態 |
+| 平台 | 功能 | 狀態 |
 |------|------|------|
-| `open_login_window` | 啟動可見瀏覽器，讓你親自登入 Facebook（只需一次） | ✅ |
-| `post_facebook` | 在個人動態牆發布文字帖 | ✅ 實測成功 |
-| `read_messenger` | 讀取 Messenger 私訊對話列表 | ✅ |
-| `read_notifications` | 讀取 Facebook 通知 | ✅ |
-| `post_threads` | 在 Threads 個人檔案發布文字+圖片帖 | ✅ 實測成功 |
+| **X.com** | 搜索熱門話題、爬蟲 | ✅ 實測成功 |
+| **Gemini** | AI 對話（分析項目、生成內容） | ✅ 實測成功 |
+| **Facebook** | 發布文字/圖片帖、讀私訊、讀通知 | ✅ 實測成功 |
+| **Threads** | 發布文字/圖片帖 | ✅ 實測成功 |
+| **Instagram** | 發布圖片帖 | ✅ 實測成功 |
+
+![Status](https://img.shields.io/badge/Status-Working-brightgreen)
+![Platform](https://img.shields.io/badge/Platform-Multi--Platform-blue)
 
 ## 原理
 
 ```
-你親自登入一次（Chromium - FacebookMCP profile）
+你親自登入一次（Chromium — FacebookMCP profile）
          ↓
-Hermes Agent 啟動 Chromium --remote-debugging-port=9333
+Chromium 啟動 --remote-debugging-port=9333
          ↓
-CDP WebSocket 接管 browser
+Playwright CDP 接管瀏覽器
          ↓
-Playwright 直接操作 DOM
-         ↓
-完成發文 / 讀取私訊 / 讀取通知
+直接操作 DOM（發文 / 爬蟲 / 對話）
 ```
 
-**為什麼不走 Graph API？**
-- Graph API 只能操作粉絲專頁，不能操作個人帳號私訊/通知
-- 需要 Facebook 開發者審批（`pages_messaging` 權限需要人工審查）
-- 我們的方案：**個人帳號能做什麼，AI 就能做什麼**
+**為什麼不走官方 API？**
+- Facebook Graph API 只能操作粉絲專頁，**個人帳號的私訊/通知讀不到**
+- X API 要付費才能發文
+- 我們的方案：**你的帳號能做什麼，AI 就能做什麼**
 
-**為什麼不用 Selenium/Playwright 直接 launch？**
-- macOS Chrome 的 cookies 使用 `login.keychain` 加密，外部程序無法直接讀取
-- 解法：透過 CDP 接管一個已經解密 cookies 的 browser session
-- 關鍵洞察由 [@Livia-Zaharia/just_facebook_mcp](https://github.com/Livia-Zaharia/just_facebook_mcp) 觸發，但該 repo 使用 headless Chrome 仍有 cookie 讀取限制
-
-## 前置需求
-
-- Python 3.11+
-- [ungoogled-chromium](https://ungoogled-privacy.github.io/)（brew install --cask chromium）
-- macOS（已測試）
-- Linux/WSL 理論上支援（需調整 profile 路徑）
+**為什麼不直接 launch Playwright？**
+- macOS Chrome cookies 用 `login.keychain` 加密，外部程序無法解密
+- 透過 CDP 接管一個已解密 session，繞過這個限制
 
 ## 安裝
 
@@ -62,201 +50,124 @@ uv sync
 
 ### 1. 建立獨立 Chromium profile
 
-建議使用獨立 profile，避免影響你日常的 Chrome session：
-
 ```bash
-# 建立 FacebookMCP profile 目錄
 mkdir -p ~/Library/Application\ Support/Chromium/FacebookMCP
 ```
 
-### 2. 在 Chromium 登入 Facebook
+### 2. 登入各平台
 
 ```bash
 open -a Chromium --args --user-data-dir="$HOME/Library/Application Support/Chromium/FacebookMCP"
 ```
 
-在瀏覽器中正常登入 Facebook。**只需做一次。**
+在瀏覽器中分別登入：
+- **Facebook**（只需一次）
+- **Instagram**（只需一次）
+- **Threads**（Facebook 登入後同步）
+- **Google**（Gemini 用，選擇性）
+- X.com 不需要登入
 
 ### 3. 啟動 CDP Server
 
-讓 Chromium 在背景以 remote debugging 模式運行：
-
 ```bash
-# 方法 A：手動啟動
 "/Applications/Chromium.app/Contents/MacOS/Chromium" \
   --remote-debugging-port=9333 \
   --user-data-dir="$HOME/Library/Application Support/Chromium/FacebookMCP" \
   --profile-directory="Default" &
-
-# 方法 B：用 launchd 自動啟動（macOS）
-# 見 scripts/ 裡的 launchd plist 範例
 ```
 
-## 使用方式
+### 4. 支援多個 CDP 端口
 
-### 直接測試發文
+`browser_hijack.py` 會自動檢測 `9333` 或 `9222`，哪個有活躍 session 就用哪個。
+
+## 使用範例
+
+### 直接發文測試
 
 ```bash
-uv run python -m social_mcp.post_facebook "測試訊息 from AI Agent 🚀"
+# Facebook 文字帖
+uv run python -m social_mcp.post_facebook "測試訊息 🚀"
+
+# Facebook 圖文帖
+uv run python -m social_mcp.post_facebook "測試訊息" /tmp/image.jpg
+
+# Threads 圖文帖
+uv run python scripts/post_threads "測試訊息 🚀" --image /tmp/image.jpg
+
+# Instagram 圖文帖
+uv run python scripts/post_instagram "caption text" /tmp/image.jpg
 ```
 
-### 啟動 MCP Server（Hermes Agent / Claude Desktop）
+### AI 對話（Gemini）
 
-```bash
-uv run social-mcp --debug
-```
-
-### Hermes Agent 設定
-
-在 `~/.hermes/config.yaml` 加入：
-
-```yaml
-mcp_servers:
-  personal-social:
-    command: "/path/to/.venv/bin/python"
-    args: ["/path/to/social-mcp/social_mcp/mcp_server.py"]
-```
-
-重啟 Hermes Gateway 後生效。
-
-### Claude Desktop 設定
-
-在 `~/Library/Application Support/Claude/claude_desktop_config.json` 加入：
-
-```json
-{
-  "mcpServers": {
-    "social": {
-      "command": "uv",
-      "args": ["run", "--project", "/path/to/social-mcp", "social-mcp"]
-    }
-  }
-}
-```
-
-## 工具使用範例
-
-```
-你：幫我發一篇 Facebook 帖：「AI Agent 自動發文測試」
-Agent → post_facebook(message="AI Agent 自動發文測試")
-       → ✅ Post published successfully!
-
-你：讀取我的 Messenger 私訊
-Agent → read_messenger()
-       → ### Messenger 私訊摘要
-         | 對話 |
-         | :--- |
-         | 張三 | ...
-
-你：看看 Facebook 有沒有通知
-Agent → read_notifications()
-       → ### Facebook 通知摘要
-         | 通知 |
-         | :--- |
-         | Kate Ngu 讚好你的回應 | ...
-```
-
-## CDP 端口與 profile 設定
-
-| 設定 | 值 |
-|------|-----|
-| Chromium 路徑 | `/Applications/Chromium.app/Contents/MacOS/Chromium` |
-| CDP 端口 | `9333` |
-| Profile 目錄 | `~/Library/Application Support/Chromium/FacebookMCP` |
-
-若你的 Chromium 路徑不同，在 `social_mcp/browser_hijack.py` 裡修改 `CHROMIUM_PATH`。
-
-## 常見問題
-
-**Q: 為什麼要用 ungoogled-chromium（Chromium）而不是 Google Chrome？**
-A: Chromium 是完全開源的，沒有 Google 更新推送等問題。任何 Chromium 都支援 `--remote-debugging-port`。
-
-**Q: 為什麼不直接用 Playwright launch headless Chrome？**
-A: macOS Chrome 的 cookies 會用 login keychain 加密。Playwright 新啟動的 headless Chrome 處於「未解密」狀態，Facebook 會偵測到異常 session。
-
-**Q: session 會過期嗎？**
-A: Facebook 有時會要求重新驗證裝置。若操作失敗，重新在 CDP Chromium 視窗登入一次即可。
-
-**Q: 支援粉絲專頁嗎？**
-A: 目前主要支援個人帳號。粉絲專頁操作（以粉絲團身份發文）需要切換到粉絲團身份，Facebook 頁面元件稍有不同，可能需要調整 DOM selector。
-
-**Q: 支援 Instagram / Threads 嗎？**
-A: ✅ Threads 支援已實測成功！見下方「Threads 發文」章節。Instagram 尚未測試。
-
-## Threads 發文
-
-Threads 使用和 Facebook 相同的 CDP Browser Hijacking 架構。Chromium 登入 Facebook 後，Threads 同步登入，無需另外設定。
-
-### 直接測試文字帖
-
-```bash
-uv run python scripts/post_threads "測試訊息 from AI Agent 🚀"
-```
-
-### 帶圖片發文
-
-```bash
-uv run python scripts/post_threads "Windows 11 SSD 速度問題" --image /tmp/ssd.jpg
-```
-
-### Python API
+用 CDP 接管 Gemini 網頁，直接對話：
 
 ```python
-from social_mcp.post_threads import post_threads
-
-# 純文字
-result = await post_threads("測試文字帖")
-
-# 圖文並茂
-result = await post_threads(
-    message="Windows 11 升級後 SSD 速度跌至 1/4？",
-    image_path="/tmp/ssd.jpg"
-)
-print(result)  # ✅ Posted to Threads in 9.2s
+# 在 Gemini 頁面輸入 prompt，自動分析 GitHub 項目
+prompt = "請分析 https://github.com/whypuss/social-mcp"
+# → Gemini 回傳完整分析報告
 ```
 
-### Threads 發文原理（與 Facebook 的差異）
+### X.com 爬蟲
 
-| 步驟 | Facebook | Threads |
-|------|----------|---------|
-| 開啟 composer | `aria-label=" 建立帖子 "` | `aria-label=" 文字欄位空白。請輸入內容以撰寫新貼文。 "` |
-| 編輯器 | 標準 `contenteditable` | Lexical `data-lexical-editor` |
-| 發布按鈕 | 直接在頁面 DOM | 在 `role="dialog"` 內（含「發佈」文字） |
-| 圖片上傳 | 點擊按鈕 → OS 文件選擇 | 找 dialog 內 `input[type="file"]` → `set_input_files()` |
-| 發布後行為 | Dialog 關閉 | Dialog 關閉，**留在 profile 頁面不跳轉** |
-
-**驗證方式**：發布後 reload profile 頁面，從 DOM 中確認內容出現。
-
-## 安全性說明
-
-- **Cookies 永遠留在本地**：所有操作都在你自己機器的 Chromium 內，cookies 不會離開你的電腦
-- **不使用任何第三方 API**：不走 Meta Graph API，不需要 access token
-- **獨立 profile**：建議使用專用 profile，避免影響日常瀏覽 session
-- **警告**：大量自動化操作可能違反 Meta 服務條款，請自行評估風險。本工具僅供個人用途。
-
-## 開發
-
-```bash
-# 安裝
-uv sync
-
-# 程式碼檢查
-uv run ruff check social_mcp/
-
-# 單元測試
-uv run pytest
+```python
+# 爬取熱門話題（20ms 拿到數據）
+await page.goto("https://x.com/explore/tabs/trending")
+trending = await page.evaluate("""
+    () => {
+        const cells = document.querySelectorAll("[data-testid='cellInnerDiv']");
+        return Array.from(cells).map(c => c.innerText).filter(t => t.length > 20);
+    }
+""")
+# → ["#TermMaxPuzzleChallenge", "#SECAwards", ...]
 ```
 
 ## 架構
 
 ```
 social_mcp/
-├── __init__.py          # 套件起點
-├── browser_hijack.py    # CDP 瀏覽器接管核心
-├── mcp_server.py        # MCP Server（stdio 模式）
-├── post_facebook.py     # Facebook 發文腳本
-└── post_threads.py      # Threads 發文腳本（支援圖文）
+├── browser_hijack.py    # CDP 接管核心（多端口自動檢測）
+├── mcp_server.py       # MCP Server（Hermes Agent / Claude Desktop）
+├── post_facebook.py    # Facebook 發文（支援圖片）
+├── post_threads.py     # Threads 發文（支援圖片）
+├── post_instagram.py   # Instagram 發文（支援圖片）
+└── scripts/
+    └── post_instagram.py  # Instagram 獨立腳本
 ```
+
+## 全新電腦復現
+
+只需三樣東西：
+
+| 項目 | 備份/復現 |
+|------|-----------|
+| `Chromium.app` | `brew install --cask chromium` |
+| `FacebookMCP` profile | `~/Library/Application Support/Chromium/FacebookMCP/`（拷貝） |
+| social-mcp 環境 | `git clone + uv sync` |
+
+拷貝 `FacebookMCP` profile 後，所有平台（Facebook / IG / Threads / Google）全部復現，**不需要重新登入**。
+
+## 常見問題
+
+**Q: session 會過期嗎？**
+A: Facebook 有時會要求重新驗證。操作失敗時，在 CDP Chromium 視窗重新登入一次即可。
+
+**Q: 支援粉絲專頁嗎？**
+A: 目前支援個人帳號。粉絲專頁需切換身份，DOM selector 需要調整。
+
+**Q: X.com 需要登入嗎？**
+A: 不需要。X.com 的內容可以匿名瀏覽。
+
+**Q: Gemini 生成圖片可以嗎？**
+A: 免費版不行，需要升級 Google AI Plus。文字對話和項目分析都正常。
+
+## 安全性
+
+- Cookies 永遠留在本地，不會傳到第三方
+- 不使用任何官方 API，不需要 access token
+- 獨立 profile，不影響日常瀏覽 session
+
+**警告**：大量自動化操作可能違反各平台服務條款，請自行評估風險。
 
 ## 授權
 

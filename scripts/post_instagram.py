@@ -72,47 +72,42 @@ async def post_instagram(caption: str, image_path: str) -> str:
         print(f"[meta-workflow] 圖片已上傳: {image_path}")
         await asyncio.sleep(3)
 
-        # ====== Step 3: 裁切頁面 → 點「下一步」 ======
-        # 等待裁切 heading 出現
-        for _ in range(10):
-            heading = await ig.evaluate(
-                "() => document.querySelector('h1,h2,h3,h4,h5,h6[level=\"1\"]')?.innerText"
-            )
-            if heading:
+        # ====== Step 3: 編輯頁面 → 點「繼續」 ======
+        # 等待 URL 變化到裁切/編輯頁面
+        for _ in range(15):
+            url = ig.url
+            if '/create/style' in url or '/create/crop' in url:
                 break
             await asyncio.sleep(0.5)
 
-        # 點「下一步」
+        # 點「繼續」（新流程）或「下一步」（舊流程）
         await ig.evaluate("""
             () => {
                 const btns = document.querySelectorAll('button');
                 for (const b of btns) {
-                    if (b.innerText?.trim() === '下一步') { b.click(); return; }
+                    const t = b.innerText?.trim();
+                    if (t === '繼續' || t === '下一步') { b.click(); return; }
                 }
             }
         """)
         await asyncio.sleep(2)
-        print("[meta-workflow] 裁切 → 濾鏡")
+        print("[meta-workflow] 編輯頁面 → 細節頁面")
 
-        # ====== Step 4: 濾鏡頁面 → 點「下一步」 ======
-        await ig.evaluate("""
-            () => {
-                const btns = document.querySelectorAll('button');
-                for (const b of btns) {
-                    if (b.innerText?.trim() === '下一步') { b.click(); return; }
-                }
-            }
-        """)
-        await asyncio.sleep(2)
-        print("[meta-workflow] 濾鏡 → 標題")
+        # ====== Step 4: 細節頁面（ caption + 分享） ======
+        # 等待 URL 到達 details 頁面
+        for _ in range(15):
+            url = ig.url
+            if '/create/details' in url:
+                break
+            await asyncio.sleep(0.5)
+        print(f"[meta-workflow] 到達 details 頁面: {ig.url}")
 
         # ====== Step 5: 輸入 caption ======
-        # 找到 contenteditable 的 caption 輸入框
+        # 新 Instagram 使用 TEXTAREA
         await ig.evaluate("""
             () => {
-                const editable = Array.from(document.querySelectorAll('[contenteditable="true"], [role="textbox"]'))
-                    .find(el => el.innerText !== undefined);
-                if (editable) editable.focus();
+                const textarea = document.querySelector('textarea');
+                if (textarea) textarea.focus();
             }
         """)
         await asyncio.sleep(0.5)
@@ -122,7 +117,7 @@ async def post_instagram(caption: str, image_path: str) -> str:
         await asyncio.sleep(1)
 
         # ====== Step 6: 點「分享」======
-        # 找「分享」按鈕並用座標點擊（比 aria-label 更可靠）
+        # 找「分享」按鈕（新版 UI 在 /create/details 頁面）
         share_info = await ig.evaluate("""
             () => {
                 const allButtons = document.querySelectorAll('button, div[role="button"]');

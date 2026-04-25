@@ -16,11 +16,10 @@ import httpx
 import websockets
 from playwright.async_api import async_playwright
 
-from social_mcp.browser_hijack import is_chromium_running
+from social_mcp.browser_hijack import is_chromium_running, get_active_cdp_port
 
 log = logging.getLogger(__name__)
 
-CDP_PORT = 9333
 THREADS_MAIN_URL = "https://www.threads.com/"
 
 
@@ -55,20 +54,22 @@ async def _type_via_cdp(ws, text: str):
 
 
 async def _get_cdp_tab_ws() -> Optional[tuple]:
-    """Get (ws_url, browser_ws_url) for threads main tab."""
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"http://localhost:{CDP_PORT}/json", timeout=5)
-            tabs = resp.json()
-        for t in tabs:
-            if t.get("url", "") == THREADS_MAIN_URL:
-                return t.get("webSocketDebuggerUrl")
-        for t in tabs:
-            u = t.get("url", "")
-            if "threads.com" in u and "compose" not in u:
-                return t.get("webSocketDebuggerUrl")
-    except Exception as e:
-        log.warning(f"CDP tab lookup failed: {e}")
+    """Get (ws_url,) for threads main tab, scanning all CDP ports."""
+    for port in [9333, 9222]:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"http://localhost:{port}/json", timeout=5)
+                tabs = resp.json()
+            for t in tabs:
+                u = t.get("url", "")
+                if "threads.com" in u and "login" not in u.lower():
+                    return t.get("webSocketDebuggerUrl")
+            for t in tabs:
+                u = t.get("url", "")
+                if "facebook.com" in u and "login" not in u.lower():
+                    return t.get("webSocketDebuggerUrl")
+        except Exception:
+            pass
     return None
 
 
@@ -94,7 +95,7 @@ async def post_threads(message: str, image_path: Optional[str] = None, wait_veri
         # ── Connect Playwright (once) ─────────────────────────────────────────
         async with async_playwright() as p:
             browser_pw = await p.chromium.connect_over_cdp(
-                f"http://localhost:{CDP_PORT}", timeout=10000
+                f"http://localhost:{get_active_cdp_port()}", timeout=10000
             )
             ctx = browser_pw.contexts[0]
 
@@ -118,12 +119,24 @@ async def post_threads(message: str, image_path: Optional[str] = None, wait_veri
             await asyncio.sleep(0.3)
 
             # ── Step 1: Open composer ─────────────────────────────────────────
+            # CRITICAL: Must use page.evaluate() to click, NOT locator.click(force=True).
+            # force=True dispatches raw mouse events but bypasses React synthetic handlers,
+            # so the dialog never actually opens. page.evaluate() runs in the same JS context
+            # and properly triggers React's onClick.
             try:
-                # Use force=True because __fb-light-mode overlay blocks pointer events
-                composer = threads_page.locator(
-                    '[aria-label="文字欄位空白。請輸入內容以撰寫新貼文。"]'
-                ).first
-                await composer.click(timeout=5000, force=True)
+                click_result = await threads_page.evaluate("""
+                    () => {
+                        const els = document.querySelectorAll("[aria-label]");
+                        for (const el of els) {
+                            if (el.getAttribute("aria-label").includes("文字欄位空白")) {
+                                el.click(); return "clicked";
+                            }
+                        }
+                        return "not found";
+                    }
+                """)
+                if click_result == "not found":
+                    return "❌ Composer area not found"
             except Exception as e:
                 return f"❌ Cannot open composer: {e}"
 
@@ -143,7 +156,7 @@ async def post_threads(message: str, image_path: Optional[str] = None, wait_veri
             # ── Step 2: Get CDP WS for this tab ─────────────────────────────
             tab_ws_url = None
             async with httpx.AsyncClient() as client:
-                resp = await client.get(f"http://localhost:{CDP_PORT}/json", timeout=5)
+                resp = await client.get(f"http://localhost:{get_active_cdp_port()}/json", timeout=5)
                 tabs = resp.json()
             for t in tabs:
                 if THREADS_MAIN_URL in t.get("url", ""):
