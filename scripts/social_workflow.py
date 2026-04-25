@@ -314,9 +314,9 @@ async def generate_caption(topic: str, ctx) -> dict:
         f"要求：\n"
         f"1. 以香港廣東話口語撰寫\n"
         f"2. 內容像真人在分享個人觀察或感受，自然地表達\n"
-        f"3. 不要加emoji\n"
-        f"4. 不要列出關鍵字或hashtag\n"
-        f"5. 150字以內\n"
+        f"3. 內容結尾加2-3個相關hashtag，以#開頭\n"
+        f"4. 不要加emoji\n"
+        f"5. 全文150字以內（包括hashtag）\n"
         f"6. 直接輸出內容，不要加標題或「以下是」等前置說明"
     )
 
@@ -328,9 +328,9 @@ async def generate_caption(topic: str, ctx) -> dict:
     clean = re.sub(r"^Gemini[^\\n]*\\n*", "", response).strip()
 
     return {
-        "facebook": {"text": clean[:300]},
-        "instagram": {"text": clean[:280]},
-        "threads": {"text": clean[:150]},
+        "facebook": {"text": clean[:280]},
+        "instagram": {"text": clean[:250]},
+        "threads": {"text": clean[:140]},
     }
 
 
