@@ -23,32 +23,60 @@ log = logging.getLogger(__name__)
 THREADS_MAIN_URL = "https://www.threads.com/"
 
 
-async def _type_via_cdp(ws, text: str):
-    """Type text via CDP Input.dispatchKeyEvent — 125 char/s, bypasses JS event handlers."""
-    char_map = {
-        " ": ("Space", "Space", 32),
-    }
+async def _type_via_cdp(ws, text: str, page):
+    """Type text via CDP Input.dispatchKeyEvent — 125 char/s for printable chars.
+
+    Enter (\n) is handled by Playwright keyboard.type() because CDP keyDown/keyUp
+    with key=Enter does NOT insert a newline in contenteditable (Lexical) divs.
+    Playwright's keyboard.type() correctly dispatches both keydown/keyup AND
+    beforeinput/input events, which Lexical listens to for paragraph breaks.
+    """
+    EOL = "\n"  # paragraph break in Lexical
+
     for ch in text:
-        if ch == " ":
+        if ch == EOL:
+            # Use Playwright keyboard — it fires beforeinput/input events correctly
+            await page.keyboard.type("\n")
+        elif ch == " ":
             key, code, kc = "Space", "Space", 32
+            for ev_type in ("keyDown", "keyUp"):
+                await ws.send(json.dumps({
+                    "id": 1, "method": "Input.dispatchKeyEvent",
+                    "params": {"type": ev_type, "text": " ", "key": key,
+                               "code": code, "windowsVirtualKeyCode": kc}
+                }))
+                json.loads(await ws.recv())
+            await asyncio.sleep(0.008)
         elif ch.isalpha():
             key, code, kc = ch.upper(), f"Key{ch.upper()}", ord(ch.upper())
+            for ev_type in ("keyDown", "keyUp"):
+                await ws.send(json.dumps({
+                    "id": 1, "method": "Input.dispatchKeyEvent",
+                    "params": {"type": ev_type, "text": ch, "key": key,
+                               "code": code, "windowsVirtualKeyCode": kc}
+                }))
+                json.loads(await ws.recv())
+            await asyncio.sleep(0.008)
         elif ch.isdigit():
-            key, code, kc = ch, f"Digit{ ch}", ord(ch)
-        elif ch == "\n":
-            key, code, kc = "Enter", "Enter", 13
+            key, code, kc = ch, f"Digit{ch}", ord(ch)
+            for ev_type in ("keyDown", "keyUp"):
+                await ws.send(json.dumps({
+                    "id": 1, "method": "Input.dispatchKeyEvent",
+                    "params": {"type": ev_type, "text": ch, "key": key,
+                               "code": code, "windowsVirtualKeyCode": kc}
+                }))
+                json.loads(await ws.recv())
+            await asyncio.sleep(0.008)
         else:
-            key, code, kc = ch, "", 0
-
-        for ev_type in ("keyDown", "keyUp"):
-            await ws.send(json.dumps({
-                "id": 1, "method": "Input.dispatchKeyEvent",
-                "params": {"type": ev_type, "text": ch, "key": key,
-                           "code": code, "windowsVirtualKeyCode": kc}
-            }))
-            json.loads(await ws.recv())
-
-        await asyncio.sleep(0.008)
+            # Chinese chars, #, emoji, etc. — send as-is via CDP
+            for ev_type in ("keyDown", "keyUp"):
+                await ws.send(json.dumps({
+                    "id": 1, "method": "Input.dispatchKeyEvent",
+                    "params": {"type": ev_type, "text": ch, "key": ch,
+                               "code": "", "windowsVirtualKeyCode": 0}
+                }))
+                json.loads(await ws.recv())
+            await asyncio.sleep(0.008)
 
     await asyncio.sleep(0.1)
 
@@ -222,7 +250,7 @@ async def post_threads(message: str, image_path: Optional[str] = None, wait_veri
                 log.debug(f"Focus result: {resp.get('result',{}).get('result',{}).get('value')}")
                 await asyncio.sleep(0.05)
 
-                await _type_via_cdp(ws, message)
+                await _type_via_cdp(ws, message, threads_page)
                 t_input = time.time()
                 log.debug(f"Typed {len(message)} chars in {t_input-t0:.2f}s")
 
