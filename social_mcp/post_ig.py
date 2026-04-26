@@ -1,26 +1,28 @@
 """
-post_ig.py — Instagram 圖文發文腳本（2026-04 實測 DOM 版）
+post_ig.py — Instagram 圖文發文腳本（2026-04-26 實測）
 
-流程：
-1. 點擊「新貼文」按鈕
-2. dialog 內 input[type=file] 上傳圖片
-3. 等 filter 頁 OR 直接跳到 sharing 頁（兩種都可能發生）
-4.  caption 輸入：div[aria-label="撰寫說明文字……"][contenteditable]
-5. 點分享：div[role=button][text=分享]
-6. 等完成
+完整流程：
+1. 點擊「新貼文」→ 選擇圖片 → 打開
+2. 裁切頁 → 按下一步
+3. 編輯/濾鏡頁 → 按下一步
+4. caption頁（撰寫說明文字）→ 輸入 caption → 分享
+5. 「已分享你的貼文」→ 按完成
 
 用法：
     uv run python -m social_mcp.post_ig "caption text" /path/to/image.jpg
 """
 import asyncio
+import json
 import sys
+import time
+import urllib.request
+import websockets
 from playwright.async_api import async_playwright
 
 IG_URL = "https://www.instagram.com"
 
 
 def _get_active_port():
-    import urllib.request
     for port in [9333, 9222]:
         try:
             req = urllib.request.Request(
@@ -35,89 +37,153 @@ def _get_active_port():
     return 9333
 
 
-def _get_dialog_text(ig) -> str:
-    return ig.evaluate(
-        "() => { const d = document.querySelector(\"[role='dialog']\"); return d ? d.innerText.slice(0, 600) : ''; }"
+def _get_ig_ws_url(port: int) -> str | None:
+    try:
+        req = urllib.request.Request(
+            f"http://localhost:{port}/json",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            tabs = json.loads(r.read())
+        for t in tabs:
+            u = t.get("url", "")
+            if "instagram.com" in u and "/login" not in u.lower():
+                return t.get("webSocketDebuggerUrl")
+    except Exception:
+        pass
+    return None
+
+
+async def _dialog_text(ig) -> str:
+    return await ig.evaluate(
+        "() => { var d = document.querySelector('[role=dialog]'); return d ? d.innerText.slice(0, 600) : ''; }"
     )
 
 
+async def _click_next_button(ig) -> bool:
+    """
+    按「下一步」。在裁切頁和編輯頁都需要。
+    實測：CDP Enter key 對 div[role=button] 的下一步有效。
+    """
+    ws_url = _get_ig_ws_url(_get_active_port())
+    if not ws_url:
+        print("[IG]   無 WS，JS fallback")
+        return False
+
+    async with websockets.connect(ws_url, max_size=20*1024*1024) as ws:
+        # Focus 下一步 button
+        await ws.send(json.dumps({
+            "id": 1, "method": "Runtime.evaluate",
+            "params": {
+                "expression": """
+                (function() {
+                    var d = document.querySelector('[role=dialog]');
+                    if (!d) return 'no_dialog';
+                    var all = d.querySelectorAll('*');
+                    for (var i = 0; i < all.length; i++) {
+                        if ((all[i].textContent||'').trim() === '下一步') {
+                            all[i].focus();
+                            return 'focused';
+                        }
+                    }
+                    return 'not_found';
+                })()
+                """,
+                "returnByValue": True
+            }
+        }))
+        resp = json.loads(await ws.recv())
+        if "focused" not in resp.get("result", {}).get("result", {}).get("value", ""):
+            print(f"[IG]   focus failed: {resp}")
+            return False
+
+        # CDP Enter
+        for ev in ["keyDown", "keyUp"]:
+            await ws.send(json.dumps({
+                "id": 2, "method": "Input.dispatchKeyEvent",
+                "params": {
+                    "type": ev, "key": "Enter", "code": "Enter",
+                    "windowsVirtualKeyCode": 13
+                }
+            }))
+            json.loads(await ws.recv())
+
+        print("[IG]   CDP Enter sent")
+        return True
+
+
 def _type_caption(ig, text: str) -> str:
-    """輸入 caption 到 IG 的說明文字欄位（2026-04 實測：aria-label='撰寫說明文字……'）"""
     return ig.evaluate(
         """([txt]) => {
-            // 找 contenteditable，aria-label 含「撰寫」or「說明文字」or「caption」
-            const dialog = document.querySelector("[role='dialog']");
-            if (!dialog) return 'no_dialog';
-
-            const ces = Array.from(dialog.querySelectorAll('[contenteditable="true"]'));
-            for (const ce of ces) {
-                const style = window.getComputedStyle(ce);
-                const aria = ce.getAttribute('aria-label') || '';
-                if (style.display !== 'none' && (aria.includes('撰寫') || aria.includes('說明文字') || aria.includes('caption'))) {
-                    ce.focus();
-                    ce.innerText = txt;
-                    ce.dispatchEvent(new Event('input', { bubbles: true }));
+            var d = document.querySelector('[role=dialog]');
+            if (!d) return 'no_dialog';
+            var ces = d.querySelectorAll('[contenteditable=true]');
+            for (var i = 0; i < ces.length; i++) {
+                var aria = ces[i].getAttribute('aria-label') || '';
+                var style = window.getComputedStyle(ces[i]);
+                if (style.display !== 'none' &&
+                    (aria.indexOf('撰寫') >= 0 || aria.indexOf('說明文字') >= 0)) {
+                    ces[i].focus();
+                    ces[i].innerText = txt;
+                    ces[i].dispatchEvent(new Event('input', {bubbles:true}));
                     return 'caption:' + aria;
                 }
             }
-
-            // Fallback: 任意可見的 contenteditable
-            for (const ce of ces) {
-                const style = window.getComputedStyle(ce);
+            for (var i = 0; i < ces.length; i++) {
+                var style = window.getComputedStyle(ces[i]);
                 if (style.display !== 'none') {
-                    ce.focus();
-                    ce.innerText = txt;
-                    ce.dispatchEvent(new Event('input', { bubbles: true }));
-                    return 'contenteditable_fallback';
+                    ces[i].focus();
+                    ces[i].innerText = txt;
+                    ces[i].dispatchEvent(new Event('input', {bubbles:true}));
+                    return 'fallback';
                 }
             }
-
             return 'no_editor';
         }""",
         [text]
     )
 
 
-async def _click_share_button(ig) -> bool:
-    """點擊「分享」按鈕（2026-04 實測：div[role=button]，非 <button>）"""
-    # 先用 Playwright locator 找
-    try:
-        share_btn = ig.get_by_text("分享", exact=False).filter(has=ig.locator('[role="button"]')).first
-        await share_btn.click(timeout=5000)
-        print("[IG]   分享: clicked via text filter")
-        return True
-    except Exception as e:
-        print(f"[IG]   分享 locator failed: {e}")
-
-    # Fallback: JS 直接點擊
-    result = await ig.evaluate("""() => {
-        const dialog = document.querySelector("[role='dialog']");
-        if (!dialog) return false;
-        // 找包含「分享」文字的 role=button 元素
-        const buttons = Array.from(dialog.querySelectorAll('[role="button"], button'));
-        for (const btn of buttons) {
-            const text = (btn.textContent || '').trim();
-            if (text === '分享' || text === '分享到' || btn.getAttribute('aria-label') === '分享') {
-                btn.click();
-                return 'clicked:' + text;
+def _click_share(ig) -> str:
+    return ig.evaluate(
+        """() => {
+            var d = document.querySelector('[role=dialog]');
+            if (!d) return 'no_dialog';
+            var btns = d.querySelectorAll('button, div[role=button]');
+            for (var i = 0; i < btns.length; i++) {
+                if ((btns[i].textContent||'').trim() === '分享') {
+                    btns[i].click(); return 'clicked:分享';
+                }
             }
-        }
-        // 找 class 含 _abl- 的分享按鈕
-        const shareBtns = Array.from(dialog.querySelectorAll('div[class*="_abl"]'));
-        if (shareBtns.length > 0) {
-            shareBtns[0].click();
-            return 'clicked:_abl_btn';
-        }
-        return 'not_found';
-    }""")
-    print(f"[IG]   分享 JS: {result}")
-    return 'not_found' not in result
+            return 'not_found';
+        }"""
+    )
+
+
+def _click_done(ig) -> str:
+    """按「完成」關閉 dialog。"""
+    return ig.evaluate(
+        """() => {
+            var d = document.querySelector('[role=dialog]');
+            if (!d) return 'no_dialog';
+            var btns = d.querySelectorAll('button, div[role=button], [aria-label]');
+            for (var i = 0; i < btns.length; i++) {
+                if ((btns[i].textContent||'').trim() === '完成') {
+                    btns[i].click(); return 'clicked:完成';
+                }
+                if (btns[i].getAttribute('aria-label') === '關閉' ||
+                    btns[i].getAttribute('aria-label') === 'Close') {
+                    btns[i].click(); return 'clicked:關閉';
+                }
+            }
+            return 'not_found';
+        }"""
+    )
 
 
 async def post_ig(caption: str, image_path: str) -> str:
+    t0 = time.time()
     port = _get_active_port()
-    if not port:
-        return "❌ 找不到 CDP Server"
 
     try:
         async with async_playwright() as p:
@@ -126,7 +192,7 @@ async def post_ig(caption: str, image_path: str) -> str:
             )
             ctx = browser.contexts[0]
 
-            # 找已登入的 IG 頁面
+            # 找 IG 頁面
             ig = None
             for pg in ctx.pages:
                 u = pg.url
@@ -144,14 +210,15 @@ async def post_ig(caption: str, image_path: str) -> str:
             await ig.bring_to_front()
             await asyncio.sleep(2)
 
-            # ── Step 1: 點擊「新貼文」 ─────────────────────
+            # ── Step 1: 點擊「新貼文」 ────────────────────────────
             print("[IG] Step 1: 點擊「新貼文」")
             await ig.evaluate(
-                "() => document.querySelector('svg[aria-label=\"新貼文\"]')?.parentElement?.click()"
+                "() => { var s = document.querySelectorAll('svg[aria-label=\"新貼文\"]'); "
+                "if (s.length > 0 && s[0].parentElement) s[0].parentElement.click(); }"
             )
             await asyncio.sleep(3)
 
-            # ── Step 2: 上傳圖片 ─────────────────────────
+            # ── Step 2: 上傳圖片 ────────────────────────────────
             print(f"[IG] Step 2: 上傳 {image_path}")
             file_input = None
             for _ in range(20):
@@ -163,100 +230,87 @@ async def post_ig(caption: str, image_path: str) -> str:
                 return "❌ 找不到 file input"
 
             await file_input.set_input_files(image_path, timeout=20000)
-            print("[IG]   圖片已設定")
-            await asyncio.sleep(4)
-
-            # ── Step 3: 等 dialog 穩定（filter 頁 或 直接 sharing 頁）────────
-            print("[IG] Step 3: 等 dialog 穩定")
-            for _ in range(20):
-                await asyncio.sleep(0.5)
-                dialog_text = await _get_dialog_text(ig)
-                if not dialog_text:
-                    continue
-                # filter 頁關鍵字：濾鏡、Aden、Clarendon、濾鏡、Next
-                if any(kw in dialog_text for kw in ['濾鏡', 'Aden', 'Clarendon', '下一步']):
-                    print(f"[IG]   到達 filter 頁")
+            print("[IG]   圖片已設定（請用戶點「打開」）")
+            # 等待用戶操作：我們無法自動觸發 macOS 的檔案選擇對話框
+            # 等待 dialog 變化（裁切頁出現）
+            for _ in range(60):
+                await asyncio.sleep(1)
+                dt = await _dialog_text(ig)
+                if "裁切" in dt or "下一步" in dt:
+                    print(f"[IG]   到達裁切頁")
                     break
-                # sharing 頁關鍵字：說明文字、撰寫、分享、分享到
-                if any(kw in dialog_text for kw in ['說明文字', '撰寫說明', '分享到', '分享\n']):
-                    print(f"[IG]   到達 sharing 頁（跳過 filter）")
-                    break
+                print(f"[IG]   等待裁切頁... ({dt[:50]})")
             else:
-                print(f"[IG]   dialog 未出現，等待後繼續: {dialog_text[:100]}")
+                return "❌ 等待裁切頁超時"
 
-            # ── Step 3b: 如果在 filter 頁，點「下一步」 ───────
-            dialog_text = await _get_dialog_text(ig)
-            if '下一步' in dialog_text:
-                print("[IG]   在 filter 頁，點下一步")
-                # 找下一步按鈕
-                next_clicked = False
-                for attempt in range(3):
-                    try:
-                        # 方法1: JS click
-                        result = await ig.evaluate("""() => {
-                            const dialog = document.querySelector("[role='dialog']");
-                            if (!dialog) return 'no_dialog';
-                            const btns = Array.from(dialog.querySelectorAll('button, [role="button"], div[aria-label]'));
-                            for (const btn of btns) {
-                                const text = (btn.textContent || '').trim();
-                                if (text === '下一步') { btn.click(); return 'clicked'; }
-                            }
-                            // 找 aria-label 含「下一步」
-                            for (const btn of btns) {
-                                if (btn.getAttribute('aria-label') === '下一步') { btn.click(); return 'aria_clicked'; }
-                            }
-                            return 'not_found';
-                        }""")
-                        print(f"[IG]   下一步 JS: {result}")
-                        if 'not_found' not in result:
-                            next_clicked = True
-                            break
-                    except Exception as e:
-                        print(f"[IG]   下一步 attempt {attempt+1} failed: {e}")
-                    await asyncio.sleep(1)
+            # ── Step 3: 裁切頁 → 按下一步 ────────────────────────
+            print("[IG] Step 3: 裁切頁 → 按下一步")
+            ok = await _click_next_button(ig)
+            if not ok:
+                return "❌ 裁切頁下一步失敗"
+            await asyncio.sleep(2)
 
-                # 等進入 details/sharing 頁
-                for _ in range(20):
-                    await asyncio.sleep(0.5)
-                    dt = await _get_dialog_text(ig)
-                    if '說明文字' in dt or '撰寫說明' in dt or '分享' in dt:
-                        print(f"[IG]   到達 caption/sharing 頁")
-                        break
+            # ── Step 4: 編輯/濾鏡頁 → 按下一步 ─────────────────
+            print("[IG] Step 4: 編輯/濾鏡頁 → 按下一步")
+            for _ in range(10):
+                dt = await _dialog_text(ig)
+                if "編輯" in dt or "濾鏡" in dt or "Aden" in dt:
+                    print(f"[IG]   到達編輯/濾鏡頁")
+                    break
+                await asyncio.sleep(0.5)
 
-            # ── Step 4: 輸入 caption ──────────────────────
-            print("[IG] Step 4: 輸入 caption")
-            await asyncio.sleep(1)
+            ok = await _click_next_button(ig)
+            if not ok:
+                return "❌ 編輯頁下一步失敗"
+            await asyncio.sleep(2)
 
-            dialog_text = await _get_dialog_text(ig)
-            print(f"[IG]   dialog 狀態: {dialog_text[:100]}")
+            # ── Step 5: Caption 頁 → 輸入 caption ──────────────
+            print("[IG] Step 5: 輸入 caption")
+            for _ in range(15):
+                dt = await _dialog_text(ig)
+                if "說明文字" in dt or "撰寫" in dt or "分享" in dt:
+                    print(f"[IG]   到達 caption 頁")
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return "❌ 等待 caption 頁超時"
 
             for attempt in range(5):
-                type_result = await _type_caption(ig, caption)
-                print(f"[IG]   輸入嘗試 {attempt+1}: {type_result}")
-                if "no_editor" not in type_result and "no_dialog" not in type_result:
+                result = _type_caption(ig, caption)
+                print(f"[IG]   輸入 {attempt+1}: {result}")
+                if "no_editor" not in result:
                     break
                 await asyncio.sleep(1)
+            else:
+                return "❌ 找不到 caption 輸入框"
 
-            await asyncio.sleep(1)
-
-            # ── Step 5: 點「分享」 ───────────────────────
-            print("[IG] Step 5: 點擊分享")
-            share_ok = await _click_share_button(ig)
-            if not share_ok:
+            # ── Step 6: 分享 ─────────────────────────────────
+            print("[IG] Step 6: 按分享")
+            share_result = _click_share(ig)
+            print(f"[IG]   {share_result}")
+            if "not_found" in share_result:
                 return "❌ 找不到分享按鈕"
 
-            print("[IG]   等待發布...")
-            # 等 dialog 消失（發布成功後 dialog 會關閉）
-            for _ in range(20):
+            # 等待「已分享你的貼文」
+            for i in range(30):
                 await asyncio.sleep(1)
-                dt = await _get_dialog_text(ig)
-                if not dt or '建立新貼文' not in dt:
-                    print(f"[IG]   dialog 已關閉，發布成功")
+                dt = await _dialog_text(ig)
+                if "已分享" in dt:
+                    print(f"[IG]   ✅ 已分享！（{i+1}s）")
                     break
+                if "分享中" in dt or "分享" in dt:
+                    print(f"[IG]   發布中... {i+1}s")
+            else:
+                print("[IG]   ⚠️  未檢測到已分享")
 
+            # ── Step 7: 按完成 ────────────────────────────────
+            print("[IG] Step 7: 按完成")
+            done_result = _click_done(ig)
+            print(f"[IG]   {done_result}")
             await asyncio.sleep(2)
+
             await browser.close()
-            return "✅ Instagram 發文完成"
+            return f"✅ Instagram 發文完成（{time.time()-t0:.1f}s）"
 
     except Exception as e:
         return f"❌ 錯誤: {e}"
@@ -264,9 +318,7 @@ async def post_ig(caption: str, image_path: str) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("用法: python post_ig.py <caption> <image_path>")
+        print("用法: python -m social_mcp.post_ig <caption> <image_path>")
         sys.exit(1)
-    caption = sys.argv[1]
-    image_path = sys.argv[2]
-    result = asyncio.run(post_ig(caption, image_path))
+    result = asyncio.run(post_ig(sys.argv[1], sys.argv[2]))
     print(result)
