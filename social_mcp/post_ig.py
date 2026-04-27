@@ -124,8 +124,13 @@ async def post_ig(caption: str, image_path: str) -> str:
         )
 
         if existing_dialog:
-            log.debug(f"已有 dialog: {repr(existing_dialog[:60])}")
-        else:
+            log.debug(f"發現殘留 dialog: {repr(existing_dialog[:60])}")
+            # 關掉殘留 dialog，重新開始
+            await ig.keyboard.press("Escape")
+            await asyncio.sleep(1)
+            existing_dialog = ""  # 強制作為「無 dialog」處理
+
+        if not existing_dialog:
             log.debug(f"當前 URL: {ig.url}")
             # 等 SVG 新貼文按鈕可見
             for attempt in range(5):
