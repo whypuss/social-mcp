@@ -33,23 +33,24 @@ _random_delay = lambda a, b: asyncio.sleep(random.uniform(a, b))
 # ── CDP JS Helpers ─────────────────────────────────────────────────────────
 
 async def _click_btn_by_text(ig, text: str, timeout: float = 10):
-    """在 page 範圍內找 text === text 的按鈕元素，CDP JS click。"""
+    """在 [role=dialog] 內找 text === text 的按鈕，用完整 pointer+mouse 事件鏈點擊。"""
     script = f"""
     () => {{
-        // [role=button] 和 <button> 標籤
-        var btns = document.querySelectorAll('[role="button"], button');
+        var dialog = document.querySelector('[role="dialog"]');
+        if (!dialog) return 'no_dialog';
+        var btns = dialog.querySelectorAll('[role="button"], button');
         for (var i = 0; i < btns.length; i++) {{
             var t = (btns[i].innerText || '').trim();
             if (t === '{text}') {{
-                btns[i].click();
-                return 'clicked:' + t;
-            }}
-        }}
-        // fallback: 包含 text
-        for (var i = 0; i < btns.length; i++) {{
-            var t = (btns[i].innerText || '').trim();
-            if (t.indexOf('{text}') >= 0) {{
-                btns[i].click();
+                var rect = btns[i].getBoundingClientRect();
+                var cx = rect.left + rect.width / 2;
+                var cy = rect.top + rect.height / 2;
+                var opts = {{ bubbles: true, cancelable: true, clientX: cx, clientY: cy, isPrimary: true, pointerId: 1, view: window }};
+                btns[i].dispatchEvent(new PointerEvent('pointerdown', opts));
+                btns[i].dispatchEvent(new PointerEvent('pointerup', opts));
+                btns[i].dispatchEvent(new MouseEvent('mousedown', opts));
+                btns[i].dispatchEvent(new MouseEvent('mouseup', opts));
+                btns[i].dispatchEvent(new MouseEvent('click', opts));
                 return 'clicked:' + t;
             }}
         }}
@@ -151,6 +152,19 @@ async def post_ig(caption: str, image_path: str) -> str:
             else:
                 await browser.close()
                 return "❌ 找不到「新貼文」按鈕，請確認已登入 IG"
+
+            # ── Step 0: 關閉殘留 dialog ───────────────────────────────────────
+            try:
+                dt = await ig.evaluate(
+                    "() => { var d = document.querySelector('[role=\"dialog\"]'); "
+                    "return d ? d.innerText.slice(0, 100) : ''; }"
+                )
+                if dt:
+                    log.debug(f"發現殘留 dialog: {repr(dt[:60])}")
+                    await ig.keyboard.press("Escape")
+                    await asyncio.sleep(1.5)
+            except Exception:
+                pass
 
             # ── Step 1: 點「新貼文」──────────────────────────────────────────
             for attempt in range(3):
@@ -263,14 +277,14 @@ async def post_ig(caption: str, image_path: str) -> str:
             await browser.close()
             return "❌ caption 頁未出現"
 
-        # 找到 caption textbox
+        # 找到 caption textbox（contenteditable DIV，不是 input）
         for _ in range(10):
             try:
                 boxes = ig.locator('[role="dialog"] [role="textbox"]')
                 if await boxes.count() > 0:
                     await boxes.first.click(timeout=2000, force=True)
-                    log.debug("Caption textbox clicked")
-                    await asyncio.sleep(0.2)
+                    log.debug("Caption textbox (contenteditable) clicked")
+                    await asyncio.sleep(0.3)
                     break
             except Exception:
                 pass
@@ -279,11 +293,17 @@ async def post_ig(caption: str, image_path: str) -> str:
             await browser.close()
             return "❌ 找不到 caption textbox"
 
-        await ig.keyboard.type(caption, delay=random.randint(40, 80))
-        log.debug(f"Caption typed: {len(caption)} chars")
-        await _random_delay(0.3, 0.5)
+        # contenteditable DIV 用 fill() 並等待 5 秒
+        textbox = ig.locator('[role="dialog"] [role="textbox"]').first
+        await textbox.fill(caption)
+        await asyncio.sleep(5.0)
 
-        # ── Step 6: 分享 ──────────────────────────────────────────────
+        # 強迫編輯器同步 React state
+        await ig.keyboard.press("ArrowRight")
+        await asyncio.sleep(0.5)
+
+        log.debug(f"Caption filled: {len(caption)} chars")
+
         r = await _click_btn_by_text(ig, "分享")
         if r == "not_found":
             await browser.close()

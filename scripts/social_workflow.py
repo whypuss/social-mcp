@@ -1,21 +1,26 @@
 """
-social_workflow.py — Google Trends HK → 圖文 → FB / IG / Threads
+social_workflow.py — 多來源熱門話題 → 圖文 → FB / Threads
 
-防重複邏輯：
-- posted_topics.json 記錄最近 12 個已發布 topic
-- 每次取 topic 時跳過已出現過的，確保每個 topic 只發一次
-- 12 個足够覆蓋 24 小時（每 2 小時跑一次）
+支援來源:
+  gtrends_hk  Google Trends 香港 (https://trends.google.com.tw/trending?geo=HK&pli=1)
+  weibo       微博熱搜 (https://s.weibo.com/top/summary?cate=realtimehot)
+  gtrends_us  Google Trends 美國 (https://trends.google.com.tw/trending?geo=US)
 
-流程（單一 CDP 連接）：
-1. Google Trends HK 熱門趨勢 → 過濾 topic（跳過已發布的）
-2. Google Images 搜尋每個 topic → base64 圖片 → 存檔
-3. 隨機角度原創 caption
-4. 關閉多餘頁面（保持 ≤ 6 個）
-5. 發布到 FB / IG / Threads
-6. 更新 posted_topics.json
+防重複邏輯:
+- 每個來源有獨立的 posted_topics_{source}.json
+- 每個 topic 只發一次
 
-Cron: 每 2 小時執行一次
-用法: uv run python scripts/social_workflow.py
+流程（單一 CDP 連接）:
+1. 根據 source 抓取熱門話題（跳過已發布的）
+2. Google Images 搜尋 topic → base64 圖片 → 存檔
+3. Gemini 生成約 100 字原創內容 + 5 個關鍵詞（繁體中文）
+4. 整理頁面（保持 ≤ 6 個）
+5. 發布到 Facebook 和 Threads
+6. 更新 posted_topics_{source}.json
+
+用法: uv run python scripts/social_workflow.py gtrends_hk
+      uv run python scripts/social_workflow.py weibo
+      uv run python scripts/social_workflow.py gtrends_us
 """
 import asyncio
 import base64
@@ -30,14 +35,33 @@ import logging
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-# Setup paths for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 log = logging.getLogger(__name__)
 
 CDP_PORT = 9333
-POSTED_TOPICS_FILE = Path.home() / ".hermes/cron/output/posted_topics.json"
-MAX_POSTED = 12  # 記錄最近 12 個，超過的自動移除最舊的
+OUTPUT_DIR = Path.home() / ".hermes/cron/output"
+MAX_POSTED = 12
+
+SOURCES = {
+    "gtrends_hk": {
+        "name": "Google Trends 香港",
+        "url": "https://trends.google.com.tw/trending?geo=HK&pli=1",
+        "row_selector": "tr.enOdEe-wZVHld-xMbwt",
+        "posted_file": OUTPUT_DIR / "posted_topics_gtrends_hk.json",
+    },
+    "weibo": {
+        "name": "微博熱搜",
+        "url": "https://s.weibo.com/top/summary?cate=realtimehot",
+        "posted_file": OUTPUT_DIR / "posted_topics_weibo.json",
+    },
+    "gtrends_us": {
+        "name": "Google Trends 美國",
+        "url": "https://trends.google.com.tw/trending?geo=US&pli=1",
+        "row_selector": "tr.enOdEe-wZVHld-xMbwt",
+        "posted_file": OUTPUT_DIR / "posted_topics_gtrends_us.json",
+    },
+}
 
 
 # ============================================================================
@@ -53,7 +77,6 @@ def _get_cdp_browser(port=9333):
                 headers={"User-Agent": "Mozilla/5.0"}
             )
             with urllib.request.urlopen(req, timeout=5) as r:
-                import json
                 tabs = json.loads(r.read())
                 return p, tabs
         except Exception:
@@ -62,67 +85,68 @@ def _get_cdp_browser(port=9333):
 
 
 # ============================================================================
-# 防重複： posted_topics 管理
+# 防重複：per-source posted_topics 管理
 # ============================================================================
 
-def load_posted_topics() -> list:
-    """讀取最近已發布的 topic 清單"""
-    if not POSTED_TOPICS_FILE.exists():
+def load_posted_topics(source: str) -> list:
+    f = SOURCES[source]["posted_file"]
+    if not f.exists():
         return []
     try:
-        with open(POSTED_TOPICS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(f, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
             return data if isinstance(data, list) else []
     except Exception:
         return []
 
 
-def save_posted_topics(topics: list):
-    """寫入已發布 topic 清單（只保留最近 MAX_POSTED 個）"""
-    POSTED_TOPICS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # 只保留最近 MAX_POSTED 個
+def save_posted_topics(source: str, topics: list):
+    f = SOURCES[source]["posted_file"]
+    f.parent.mkdir(parents=True, exist_ok=True)
     trimmed = topics[-MAX_POSTED:]
-    with open(POSTED_TOPICS_FILE, "w", encoding="utf-8") as f:
-        json.dump(trimmed, f, ensure_ascii=False, indent=2)
+    with open(f, "w", encoding="utf-8") as fp:
+        json.dump(trimmed, fp, ensure_ascii=False, indent=2)
 
 
-def add_posted_topic(topic: str):
-    """新增一個 topic 到已發布清單"""
-    topics = load_posted_topics()
-    # 移除重複（如果有的話）
+def add_posted_topic(source: str, topic: str):
+    topics = load_posted_topics(source)
     topics = [t for t in topics if t != topic]
     topics.append(topic)
-    save_posted_topics(topics)
+    save_posted_topics(source, topics)
 
 
 # ============================================================================
-# Step 1: Google Trends HK 熱門趨勢
+# Step 1: 熱門話題抓取（各來源）
 # ============================================================================
 
-async def get_gtrends_hk(browser, ctx, skip_topics: list) -> list:
-    """取得 Google Trends HK 熱門話題（跳過已發布的 + 太抽象的關鍵詞）"""
-    abstract_keywords = ["1994", "1995", "1996", "1997", "1998", "1999",
-                         "2000", "2001", "2002", "2003", "2004",
-                         "series", "episode", "ep1", "ep2", "trailer",
-                         "awards", "fans", "fammeet"]
+ABSTRACT_KEYWORDS = [
+    "1994", "1995", "1996", "1997", "1998", "1999",
+    "2000", "2001", "2002", "2003", "2004",
+    "series", "episode", "ep1", "ep2", "trailer",
+    "awards", "fans", "fammeet",
+]
 
-    gt_page = None
+
+async def _ensure_trends_page(ctx, url: str):
+    """找已開的 trends 頁，或開新頁"""
     for pg in ctx.pages:
         if "trends.google" in pg.url.lower():
-            gt_page = pg
-            break
-
-    if not gt_page:
-        gt_page = await ctx.new_page()
-
-    await gt_page.goto(
-        "https://trends.google.com.tw/trending?geo=HK&pli=1",
-        wait_until="domcontentloaded",
-        timeout=30000
-    )
+            return pg
+    pg = await ctx.new_page()
+    await pg.goto(url, wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(5)
+    return pg
 
-    # Scroll to load more topics
+
+async def _get_gtrends_topics(browser, ctx, source: str) -> list:
+    """抓 Google Trends HK 或 US 的話題"""
+    cfg = SOURCES[source]
+    skip_topics = load_posted_topics(source)
+
+    gt_page = await _ensure_trends_page(ctx, cfg["url"])
+    await gt_page.bring_to_front()
+    await asyncio.sleep(2)
+
     for _ in range(5):
         await gt_page.evaluate("window.scrollBy(0, 600)")
         await asyncio.sleep(0.5)
@@ -143,24 +167,65 @@ async def get_gtrends_hk(browser, ctx, skip_topics: list) -> list:
         return [...new Set(topics)];
     }""")
 
-    # Clean up: remove spaces, filter abstract keywords
+    return _clean_topics(topics_raw, skip_topics)
+
+
+async def _get_weibo_topics(browser, ctx, source: str) -> list:
+    """抓微博熱搜話題"""
+    skip_topics = load_posted_topics(source)
+
+    wb_page = None
+    for pg in ctx.pages:
+        if "weibo.com" in pg.url.lower() and "s.weibo.com" in pg.url.lower():
+            wb_page = pg
+            break
+
+    if not wb_page:
+        wb_page = await ctx.new_page()
+
+    await wb_page.goto(
+        "https://s.weibo.com/top/summary?cate=realtimehot",
+        wait_until="domcontentloaded",
+        timeout=30000
+    )
+    await asyncio.sleep(4)
+
+    topics_raw = await wb_page.evaluate("""() => {
+        // 微博熱搜榜，選擇 <td> 第一個 <a> 的文字
+        const tds = document.querySelectorAll('td');
+        const topics = [];
+        for (const td of tds) {
+            const a = td.querySelector('a');
+            if (!a) continue;
+            const t = (a.innerText || '').trim();
+            // 跳過熱搜排名數字（1, 2, 3...）和熱搜/榜之類的導航
+            if (/^\\d+$/.test(t)) continue;
+            if (t.length >= 2 && t.length <= 30) {
+                topics.push(t);
+            }
+        }
+        return [...new Set(topics)];
+    }""")
+
+    return _clean_topics(topics_raw, skip_topics)
+
+
+def _clean_topics(topics_raw: list, skip_topics: list) -> list:
+    """過濾：去空格、去重、去 abstract、去已發布"""
     cleaned = []
     seen = set()
-    skip_set = set(skip_topics)  # 已發布過的
+    skip_set = set(skip_topics)
     for t in topics_raw:
         t_clean = re.sub(r'\s+', '', t).strip()
         if not t_clean or t_clean in seen:
             continue
         seen.add(t_clean)
         lower = t_clean.lower()
-        # 跳過已發布
         if t_clean in skip_set:
             continue
-        # 跳過抽象關鍵詞
-        if any(kw in lower for kw in abstract_keywords if len(kw) > 3):
+        if any(kw in lower for kw in ABSTRACT_KEYWORDS if len(kw) > 3):
             continue
         cleaned.append(t_clean)
-
     return cleaned[:12]
 
 
@@ -225,23 +290,6 @@ async def search_google_image(browser, ctx, topic: str) -> str:
 
 
 # ============================================================================
-# Step 3: 原創風格 caption（4 種隨機角度）
-# ============================================================================
-
-def to_traditional(text: str) -> str:
-    replacements = [
-        ("趋势", "趨勢"), ("热门", "熱門"), ("话题", "話題"),
-        ("挑战", "挑戰"), ("视频", "視頻"), ("电影", "電影"),
-        ("热门话题", "熱門話題"), ("正在流行", "正在流行"),
-        ("足球", "足球"), ("比赛", "比賽"), ("直播", "直播"),
-    ]
-    result = text
-    for old, new in replacements:
-        result = result.replace(old, new)
-    return result
-
-
-# ============================================================================
 # Gemini caption 生成
 # ============================================================================
 
@@ -249,7 +297,6 @@ GEMINI_INPUT = 'div[aria-label="請輸入 Gemini 提示詞"]'
 
 
 async def _find_gemini_page(ctx):
-    """Find or create Gemini page"""
     for pg in ctx.pages:
         if "gemini.google.com" in pg.url:
             return pg
@@ -260,7 +307,6 @@ async def _find_gemini_page(ctx):
 
 
 async def call_gemini(page, prompt: str, timeout=90) -> str:
-    """Send prompt to Gemini, return response text (max 500 chars)"""
     inp = page.locator(GEMINI_INPUT)
     await inp.click()
     await inp.fill("")
@@ -286,14 +332,12 @@ async def call_gemini(page, prompt: str, timeout=90) -> str:
 
         elapsed = int(time.time() - start)
 
-        # If substantial text (>80 chars) and at least 25s passed, take it
         if len(response['text']) > 80 and elapsed > 25:
             return response['text'][:500]
 
         if response['status'] == 'done' and len(response['text']) > 5:
             return response['text'][:500]
 
-    # Final fallback
     response = await page.evaluate("""() => {
         const all = Array.from(document.querySelectorAll('.model-response-text'));
         if (all.length === 0) return '';
@@ -302,53 +346,69 @@ async def call_gemini(page, prompt: str, timeout=90) -> str:
     return response[:500] if response else "[Gemini timeout]"
 
 
-async def generate_caption(topic: str, ctx) -> dict:
-    """用 Gemini 生成原創 caption（150字广东话）"""
+async def generate_caption(topic: str, source: str, ctx) -> dict:
+    """
+    用 Gemini 生成原創內容（繁體中文）：
+    - 約 100 字正文
+    - 5 個關鍵詞
+    - 格式：正文\n\n關鍵詞：#xxx #xxx #xxx #xxx #xxx
+    """
     gemini_page = await _find_gemini_page(ctx)
     await gemini_page.bring_to_front()
 
+    source_name = SOURCES[source]["name"]
+
     prompt = (
         f"你是一個香港社交媒體內容創作專家。\n"
-        f"請為以下話題創作一篇約150字的原創Facebook帖子內容：\n\n"
-        f"話題：「{topic}」\n\n"
+        f"請為以下話題創作一篇 Facebook / Threads 帖子：\n\n"
+        f"話題：「{topic}」（來源：{source_name}）\n\n"
         f"要求：\n"
-        f"1. 以香港廣東話口語撰寫\n"
-        f"2. 內容像真人在分享個人觀察或感受，自然地表達\n"
-        f"3. 內容結尾加2-3個相關hashtag，以#開頭\n"
-        f"4. 不要加emoji\n"
-        f"5. 全文150字以內（包括hashtag）\n"
-        f"6. 直接輸出內容，不要加標題或「以下是」等前置說明"
+        f"1. 繁體中文（台灣/香港正體字）\n"
+        f"2. 約 100 字正文，口語化，像真人在分享\n"
+        f"3. 正文結尾自選位置加 5 個 hashtag（#關鍵詞），用繁體\n"
+        f"4. 不要加 emoji\n"
+        f"5. 嚴格在 120 字以內（正文+關鍵詞合計）\n"
+        f"6. 直接輸出，不要前置說明\n"
+        f"7. 格式：正文內容（可含 hashtags）\n"
+        f"   關鍵詞：#關鍵詞1 #關鍵詞2 #關鍵詞3 #關鍵詞4 #關鍵詞5"
     )
 
-    log.info(f"[Gemini] 生成 caption for '{topic}'...")
+    log.info(f"[Gemini] 生成 caption for '{topic}' ({source_name})...")
     response = await call_gemini(gemini_page, prompt)
     log.info(f"[Gemini] 回應 {len(response)} chars: {response[:60]}...")
 
-    # Gemini 回應有時包含 "Gemini 說了" 之類的前綴，剝離它
-    clean = re.sub(r"^Gemini[^\\n]*\\n*", "", response).strip()
+    # 清理 Gemini 輸出前綴
+    clean = re.sub(r"^Gemini[^\n]*\n*", "", response).strip()
 
+    # 從回應中拆分正文和關鍵詞
+    body_text = clean
+    keywords_text = ""
+
+    # 如果包含「關鍵詞：」或「关键词：」，拆分
+    kw_match = re.search(r'[關关]鍵詞[：:]\s*(.+)', clean, re.UNICODE)
+    if kw_match:
+        body_text = clean[:kw_match.start()].strip()
+        keywords_text = kw_match.group(1).strip()
+        # 確保關鍵詞格式正確
+        if not keywords_text.startswith('#'):
+            hashtags = re.findall(r'#[\w\u4e00-\u9fff]+', keywords_text)
+            keywords_text = " ".join(hashtags) if hashtags else keywords_text
+
+    # 合併為完整 caption（正文在前，關鍵詞在最後）
+    if keywords_text:
+        full_caption = f"{body_text}\n\n{keywords_text}"
+    else:
+        full_caption = body_text
+
+    # Threads 截斷至 140 字，FB 留 500
     return {
-        "facebook": {"text": clean[:280]},
-        "instagram": {"text": clean[:250]},
-        "threads": {"text": clean[:140]},
+        "facebook": {"text": full_caption[:500]},
+        "threads": {"text": full_caption[:140]},
     }
 
 
-def prepare_posts(topic: str, image_path: str, ctx=None) -> dict:
-    """用 Gemini 生成 caption，image_path 在調用方注入"""
-    # Gemini caption generation is async; caller should use generate_caption()
-    # This is kept for backwards compat - if ctx not provided, return placeholder
-    if ctx is None:
-        return {
-            "facebook": {"text": f"關於「{topic}」的香港熱門話題", "image": image_path},
-            "instagram": {"text": f"「{topic}」香港熱門話題", "image": image_path},
-            "threads": {"text": f"「{topic}」", "image": image_path},
-        }
-    raise NotImplementedError("Use generate_caption() directly")
-
-
 # ============================================================================
-# Step 4: 關閉多餘頁面
+# Step 3: 頁面整理
 # ============================================================================
 
 async def close_extra_pages(ctx, max_pages=6):
@@ -357,38 +417,32 @@ async def close_extra_pages(ctx, max_pages=6):
         log.info(f"[PageMgr] {current_count} pages, no need to close")
         return
 
-    pages_to_close = []
     priority_close = []
-
     for pg in list(ctx.pages):
         u = pg.url
-        if "tbm=isch" in u:
+        if "tbm=isch" in u or "github.com" in u.lower():
             priority_close.append(pg)
-            continue
-        if "github.com" in u.lower():
-            priority_close.append(pg)
-            continue
 
     total_to_close = current_count - max_pages
     for pg in priority_close[:total_to_close]:
         await pg.close()
-        pages_to_close.append(pg.url[:50])
-
-    log.info(f"[PageMgr] Closed {len(pages_to_close)} pages: {pages_to_close}")
-    log.info(f"[PageMgr] Remaining: {len(ctx.pages)} pages")
+        log.info(f"[PageMgr] Closed: {pg.url[:50]}")
 
 
 # ============================================================================
-# Main workflow（單一 CDP 連接）
+# Main workflow
 # ============================================================================
 
-async def run_workflow():
-    print("=" * 50)
-    print("Social Workflow (Google Trends HK)")
-    print("=" * 50)
+async def run_workflow(source: str):
+    cfg = SOURCES.get(source)
+    if not cfg:
+        return {"error": f"未知來源: {source}"}
 
-    # 讀取已發布 topic（防重複）
-    posted = load_posted_topics()
+    print("=" * 60)
+    print(f"Social Workflow ({cfg['name']})")
+    print("=" * 60)
+
+    posted = load_posted_topics(source)
     print(f"\n[Init] 已發布 topic ({len(posted)}): {posted[-5:]}")
 
     async with async_playwright() as p:
@@ -398,17 +452,23 @@ async def run_workflow():
         )
         ctx = browser.contexts[0]
 
-        # ── Step 1: Google Trends HK（跳過已發布的）─────────
-        print("\n[Step 1] 抓 Google Trends HK...")
-        topics = await get_gtrends_hk(browser, ctx, skip_topics=posted)
+        # ── Step 1: 抓話題 ─────────────────────────────────
+        print(f"\n[Step 1] 抓取 {cfg['name']} 話題...")
+        if source == "weibo":
+            topics = await _get_weibo_topics(browser, ctx, source)
+        else:
+            topics = await _get_gtrends_topics(browser, ctx, source)
+
         if not topics:
-            print("❌ 無法取得熱門話題（或全部已發布過）")
+            print("❌ 無法取得話題（或全部已發布過）")
+            await browser.close()
             return {"error": "No topics available"}
+
         print(f"  取得 {len(topics)} 個話題:")
         for i, t in enumerate(topics):
             print(f"  {i+1}. {t[:60]}")
 
-        # ── Step 2: 找圖片 ───────────────────────
+        # ── Step 2: 找圖片 ─────────────────────────────────
         chosen_topic = None
         image_path = None
 
@@ -420,62 +480,66 @@ async def run_workflow():
                 print(f"  ✅ 圖片找到: {image_path}")
                 break
             else:
-                print(f"  ❌ 找不到相關圖片，跳過")
+                print(f"  ❌ 找不到圖片，跳過")
 
         if not chosen_topic or not image_path:
             print("❌ 所有話題都找不到圖片，結束")
             await browser.close()
             return {"error": "No image found"}
 
-        # ── Step 3: Gemini 生成原創 caption ─────────
-        print("\n[Step 3] Gemini 生成原創 caption...")
-        raw_posts = await generate_caption(chosen_topic, ctx)
-        for platform in raw_posts:
-            raw_posts[platform]["image"] = image_path
-        posts = raw_posts
-        print(f"  FB: {posts['facebook']['text'][:60]}...")
-        print(f"  IG: {posts['instagram']['text'][:60]}...")
+        # ── Step 3: Gemini 生成內容 ──────────────────────
+        print("\n[Step 3] Gemini 生成原創內容...")
+        posts = await generate_caption(chosen_topic, source, ctx)
+        for platform in posts:
+            posts[platform]["image"] = image_path
+        print(f"  FB:   {posts['facebook']['text'][:60]}...")
         print(f"  Threads: {posts['threads']['text'][:60]}...")
 
-        # ── Step 4: 關閉多餘頁面 ────────────────
+        # ── Step 4: 整理頁面 ──────────────────────────────
         print("\n[Step 4] 整理頁面...")
         await close_extra_pages(ctx, max_pages=6)
 
-        # ── Step 5: 發布 ──────────────────────
-        print("\n[Step 5] 發布到各平台...")
+        # ── Step 5: 發布 ────────────────────────────────
+        print("\n[Step 5] 發布到 FB 和 Threads...")
         from social_mcp.post_facebook import post_facebook
-        from social_mcp.post_ig import post_ig
         from social_mcp.post_threads import post_threads
 
         results = {}
 
-        for platform, post_data in posts.items():
-            try:
-                text = post_data["text"]
-                img = post_data["image"]
+        # 先發 Threads
+        try:
+            result = await post_threads(
+                posts["threads"]["text"],
+                posts["threads"]["image"]
+            )
+            print(f"  [Threads] {result}")
+            results["threads"] = result
+        except Exception as e:
+            msg = f"❌ {e}"
+            print(f"  [Threads] {msg}")
+            results["threads"] = msg
 
-                if platform == "facebook":
-                    result = await post_facebook(text, img)
-                elif platform == "instagram":
-                    result = await post_ig(text, img)
-                elif platform == "threads":
-                    result = await post_threads(text, img)
+        # 再發 Facebook
+        try:
+            result = await post_facebook(
+                posts["facebook"]["text"],
+                posts["facebook"]["image"]
+            )
+            print(f"  [Facebook] {result}")
+            results["facebook"] = result
+        except Exception as e:
+            msg = f"❌ {e}"
+            print(f"  [Facebook] {msg}")
+            results["facebook"] = msg
 
-                print(f"  [{platform}] {result}")
-                results[platform] = result
-            except Exception as e:
-                msg = f"❌ {e}"
-                print(f"  [{platform}] {msg}")
-                results[platform] = msg
+        # ── Step 6: 標記 topic 為已發布 ──────────────────
+        print(f"\n[Step 6] 更新已發布記錄...")
+        add_posted_topic(source, chosen_topic)
+        print(f"  ✅ '{chosen_topic}' 已加入 {source} 已發布清單")
 
-        # ── Step 6: 標記 topic 為已發布 ─────────
-        print("\n[Step 6] 更新已發布記錄...")
-        add_posted_topic(chosen_topic)
-        print(f"  ✅ '{chosen_topic}' 已加入已發布清單")
-
-        print("\n" + "=" * 50)
+        print("\n" + "=" * 60)
         print("Workflow 完成")
-        print("=" * 50)
+        print("=" * 60)
         for platform, result in results.items():
             print(f"  {platform}: {result}")
 
@@ -484,4 +548,5 @@ async def run_workflow():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_workflow())
+    source = sys.argv[1] if len(sys.argv) > 1 else "gtrends_hk"
+    asyncio.run(run_workflow(source))
