@@ -506,31 +506,61 @@ async def run_workflow(source: str):
 
         results = {}
 
-        # 先發 Threads
-        try:
-            result = await post_threads(
-                posts["threads"]["text"],
-                posts["threads"]["image"]
-            )
-            print(f"  [Threads] {result}")
-            results["threads"] = result
-        except Exception as e:
-            msg = f"❌ {e}"
-            print(f"  [Threads] {msg}")
-            results["threads"] = msg
+        # 先發 Threads（失敗最多重試 3 次，每次隔 10 秒）
+        threads_ok = False
+        for attempt in range(4):
+            try:
+                result = await post_threads(
+                    posts["threads"]["text"],
+                    posts["threads"]["image"]
+                )
+                if "❌" not in result and "error" not in result.lower():
+                    print(f"  [Threads] {result}")
+                    results["threads"] = result
+                    threads_ok = True
+                    break
+                else:
+                    print(f"  [Threads] {result} (attempt {attempt+1}/3)")
+                    if attempt < 3:
+                        print(f"  [Threads] 10 秒後重試...")
+                        await asyncio.sleep(10)
+            except Exception as e:
+                msg = f"❌ {e}"
+                print(f"  [Threads] {msg} (attempt {attempt+1}/3)")
+                if attempt < 3:
+                    print(f"  [Threads] 10 秒後重試...")
+                    await asyncio.sleep(10)
+                results["threads"] = msg
+        if not threads_ok:
+            print(f"  [Threads] 3 次嘗試均失敗")
 
-        # 再發 Facebook
-        try:
-            result = await post_facebook(
-                posts["facebook"]["text"],
-                posts["facebook"]["image"]
-            )
-            print(f"  [Facebook] {result}")
-            results["facebook"] = result
-        except Exception as e:
-            msg = f"❌ {e}"
-            print(f"  [Facebook] {msg}")
-            results["facebook"] = msg
+        # 再發 Facebook（失敗最多重試 3 次，每次隔 10 秒）
+        fb_ok = False
+        for attempt in range(4):
+            try:
+                result = await post_facebook(
+                    posts["facebook"]["text"],
+                    posts["facebook"]["image"]
+                )
+                if "❌" not in result and "error" not in result.lower():
+                    print(f"  [Facebook] {result}")
+                    results["facebook"] = result
+                    fb_ok = True
+                    break
+                else:
+                    print(f"  [Facebook] {result} (attempt {attempt+1}/3)")
+                    if attempt < 3:
+                        print(f"  [Facebook] 10 秒後重試...")
+                        await asyncio.sleep(10)
+            except Exception as e:
+                msg = f"❌ {e}"
+                print(f"  [Facebook] {msg} (attempt {attempt+1}/3)")
+                if attempt < 3:
+                    print(f"  [Facebook] 10 秒後重試...")
+                    await asyncio.sleep(10)
+                results["facebook"] = msg
+        if not fb_ok:
+            print(f"  [Facebook] 3 次嘗試均失敗")
 
         # ── Step 6: 標記 topic 為已發布 ──────────────────
         print(f"\n[Step 6] 更新已發布記錄...")
