@@ -620,7 +620,11 @@ async def run_workflow(source: int):
         for plat, res in results.items():
             print(f"  {plat}: {res}")
 
-        await browser.close()
+        try:
+            await browser.close()
+        except Exception as e:
+            # CDP mode: browser is external, close is optional
+            log.info(f"[Browser] close skipped (CDP mode): {e}")
         return results
 
 
