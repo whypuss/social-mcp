@@ -441,7 +441,7 @@ async def generate_caption(topic: str, source: int, ctx) -> dict:
 
 請嚴格按照以下格式輸出，不要加任何前置說明：
 
-【正文】（約 100 字，繁體中文，廣東話口語，像真人在分享個人感受，自然地表達，不要加 emoji）
+【正文】（約 100 字，繁體中文，廣東話口語，客觀資訊類風格，例如「据悉」「有消息指」「近日」之類，不要用「我」「我們」「我睇到」「我去咗」等第一人稱，純資訊分享，不要加 emoji）
 
 【關鍵詞】（5個，用 # 開頭，繁體中文，例如：#香港 #話題 #電影 #推薦 #熱門）
 
@@ -470,17 +470,17 @@ async def generate_caption(topic: str, source: int, ctx) -> dict:
     body_text = _to_traditional(body_text)
     keywords_text = _to_traditional(keywords_text)
 
-    # 組合完整 caption
-    fb_full = body_text
-    if keywords_text:
-        fb_full = f"{body_text}\n\n{keywords_text}"
+    # 組合完整 caption（關鍵詞全部加上）
+    def make_caption(body, keywords, max_len):
+        full = f"{body}\n\n{keywords}" if keywords else body
+        return full[:max_len]
 
     return {
         "body": body_text,
         "keywords": keywords_text,
-        "fb": fb_full[:280],
-        "ig": body_text[:220],
-        "threads": body_text[:140],
+        "fb": make_caption(body_text, keywords_text, 280),
+        "ig": make_caption(body_text, keywords_text, 200),
+        "threads": make_caption(body_text, keywords_text, 500),
     }
 
 
