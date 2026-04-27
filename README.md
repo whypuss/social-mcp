@@ -114,17 +114,35 @@ prompt = "請分析 https://github.com/whypuss/ai-cdp-browser"
 ```
 
 ## 架構
+## Skills（Hermes Agent 技能庫）
 
+`skills/` 目錄包含 Hermes Agent 使用的瀏覽器自動化技能。
+
+| Skill | 用途 | 核心方法 |
+|-------|------|---------|
+| `instagram-workflow` | IG 圖文發文 | filechooser 事件監聽器上傳圖片 |
+| `facebook-workflow` | FB 圖文發文 | base64 DataTransfer 注入（React 不吃 input.files） |
+| `threads-composer-debug` | Threads 發文 | Playwright 純 Selector，force=True 繞過 overlay |
+| `facebook-mcp-browser-setup` | Chromium 瀏覽器設定 | ungoogled-chromium + 獨立 profile |
+
+詳細文檔：[skills/README.md](skills/README.md)
+
+## 架構
 ```
 ai-cdp-browser/
 ├── social_mcp/
 │   ├── browser_hijack.py    # CDP 接管核心（多端口自動檢測）
 │   ├── mcp_server.py       # MCP Server（Hermes Agent / Claude Desktop）
-│   ├── post_facebook.py     # Facebook 發文（支援圖片）
-│   ├── post_ig.py          # Instagram 發文（支援圖片，2026-04 實測 DOM 版）
-│   ├── post_threads.py      # Threads 發文（支援圖片）
+│   ├── post_facebook.py     # Facebook 發文（支援圖片，DataTransfer 注入）
+│   ├── post_ig.py          # Instagram 發文（支援圖片，filechooser）
+│   ├── post_threads.py      # Threads 發文（支援圖片，Playwright Selector）
 │   └── browser_hijack.py
-│
+├── skills/                   # Hermes Agent 技能庫
+│   ├── instagram-workflow/
+│   ├── facebook-workflow/
+│   ├── threads-composer-debug/
+│   ├── facebook-mcp-browser-setup/
+│   └── README.md
 └── scripts/
     └── social_workflow.py   # 統一 workflow：Google Trends → Gemini → 三平臺自動發文
 ```
