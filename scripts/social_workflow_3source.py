@@ -26,14 +26,15 @@ Cron（hermes-skills）：
 import asyncio
 import base64
 import json
+import logging
 import os
 import random
 import re
 import sys
 import time
 import urllib.parse
-import logging
 from pathlib import Path
+import requests
 from playwright.async_api import async_playwright
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -197,6 +198,11 @@ async def fetch_weibo(ctx, skip_topics: list) -> list:
             const text = (a.innerText || '').trim();
             // 跳過數字排名，只取標題
             const cleaned = text.replace(/^\\d+/, '').trim();
+            // 只取有數字排序的話題（置頂/熱門/推薦等無數字的都跳過）
+            if (!/^\d/.test(text)) continue;
+            if (cleaned.includes('置顶') || cleaned.includes('置頂') ||
+                cleaned.includes('热') || cleaned.includes('熱') ||
+                cleaned.includes('荐') || cleaned.includes('薦')) continue;
             if (cleaned.length >= 2 && cleaned.length <= 30) {
                 topics.push(cleaned);
             }
@@ -330,22 +336,22 @@ async def search_google_image(ctx, topic: str) -> str:
 
     for img_url in media_urls:
         try:
-            # 直接下載圖片
-            async with b_page.context.request.get(img_url, timeout=15) as resp:
-                if resp.status == 200:
-                    content_type = resp.headers.get("content-type", "")
-                    ext = "jpg"
-                    if "webp" in content_type.lower():
-                        ext = "webp"
-                    elif "png" in content_type.lower():
-                        ext = "png"
-                    img_bytes = await resp.body()
-                    if len(img_bytes) > 5000:
-                        out_path = f"/tmp/social3_{int(time.time())}_{random.randint(100,999)}.{ext}"
-                        with open(out_path, "wb") as f:
-                            f.write(img_bytes)
-                        log.info(f"[Images] 下載成功 {len(img_bytes)} bytes: {out_path}")
-                        return out_path
+            # 用 requests（自帶 redirect、速度快）
+            r = requests.get(img_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+            if r.status_code == 200:
+                content_type = r.headers.get("content-type", "")
+                ext = "jpg"
+                if "webp" in content_type.lower():
+                    ext = "webp"
+                elif "png" in content_type.lower():
+                    ext = "png"
+                img_bytes = r.content
+                if len(img_bytes) > 5000:
+                    out_path = f"/tmp/social3_{int(time.time())}_{random.randint(100,999)}.{ext}"
+                    with open(out_path, "wb") as f:
+                        f.write(img_bytes)
+                    log.info(f"[Images] 下載成功 {len(img_bytes)} bytes: {out_path}")
+                    return out_path
         except Exception as e:
             log.warning(f"[Images] 下載失敗 {img_url[:60]}: {e}")
             continue
@@ -372,9 +378,9 @@ async def call_gemini(page, prompt: str, timeout=90) -> str:
     inp = page.locator(GEMINI_INPUT)
     await inp.click()
     await inp.fill("")
-    await asyncio.sleep(0.5)
-    await inp.type(prompt, delay=40)
-    await asyncio.sleep(1)
+    await asyncio.sleep(1.0)  # 等 fill 完全生效，DOM 穩定
+    await inp.type(prompt, delay=60)  # 60ms/字，確保每個字都輸入到位
+    await asyncio.sleep(1.5)  # 等 React state 更新，確保文字完全進入 input
     await page.keyboard.press("Enter")
 
     await asyncio.sleep(6)
@@ -461,8 +467,11 @@ async def generate_caption(topic: str, source: int, ctx) -> dict:
     response = await call_gemini(gemini_page, prompt)
     log.info(f"[Gemini] 回應 {len(response)} chars: {response[:80]}...")
 
-    # 清理 Gemini 前綴
-    clean = re.sub(r"^(Gemini[^\\n]*\\n*|以下是[^\\n]*\\n*)", "", response).strip()
+    # 清理 Gemini 前綴（直接刪掉無效正則，直接去掉【正文】開頭）
+    clean = response.strip()
+    # 移除可能有的 "【正文】" 開頭標記
+    if clean.startswith("【正文】"):
+        clean = clean[len("【正文】"):].strip()
 
     # 提取正文和關鍵詞
     body_text = ""
@@ -472,6 +481,9 @@ async def generate_caption(topic: str, source: int, ctx) -> dict:
         parts = clean.split("【關鍵詞】")
         body_text = parts[0].replace("【正文】", "").strip()
         keywords_text = parts[1].strip() if len(parts) > 1 else ""
+        # 如果正文為空但關鍵詞有內容，用標題當正文（Gemini 正文未生成）
+        if not body_text and keywords_text:
+            body_text = f"針對「{topic}」的熱門討論引發關注。"
     else:
         # fallback：整段當正文
         body_text = clean
@@ -594,16 +606,26 @@ async def run_workflow(source: int):
         await close_extra_pages(ctx, max_pages=6)
 
         # ── Step 5: 發布 ──────────────────────────────────────
-        print(f"\n[Step 5] 發布到 FB → IG → Threads...")
+        print(f"\n[Step 5] 發布到 FB → Threads...")
         from social_mcp.post_facebook import post_facebook
-        from social_mcp.post_ig import post_ig
         from social_mcp.post_threads import post_threads
+
+        # 確保 Threads tab 已打開（post_threads 需要現成的 tab 否則會失敗）
+        threads_tab = None
+        for pg in ctx.pages:
+            if "threads.net" in pg.url and "settings" not in pg.url:
+                threads_tab = pg
+                break
+        if not threads_tab:
+            print("  [Threads] 開新標籤...")
+            threads_tab = await ctx.new_page()
+            await threads_tab.goto("https://www.threads.net/", wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(3)
 
         results = {}
 
         platforms = [
             ("facebook", caption_data["fb"], post_facebook),
-            ("instagram", caption_data["ig"], post_ig),
             ("threads", caption_data["threads"], post_threads),
         ]
 
