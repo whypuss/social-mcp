@@ -501,7 +501,7 @@ async def generate_caption(topic: str, source: int, ctx) -> dict:
         "body": body_text,
         "keywords": keywords_text,
         "fb": make_caption(body_text, keywords_text, 280),
-        "ig": make_caption(body_text, keywords_text, 200),
+        "ig": make_caption(body_text, keywords_text, 500),
         "threads": make_caption(body_text, keywords_text, 500),
     }
 
@@ -606,9 +606,10 @@ async def run_workflow(source: int):
         await close_extra_pages(ctx, max_pages=6)
 
         # ── Step 5: 發布 ──────────────────────────────────────
-        print(f"\n[Step 5] 發布到 FB → Threads...")
+        print(f"\n[Step 5] 發布到 FB → Threads → IG...")
         from social_mcp.post_facebook import post_facebook
         from social_mcp.post_threads import post_threads
+        from social_mcp.post_ig_human import post_ig_human
 
         # 確保 Threads tab 已打開（post_threads 需要現成的 tab 否則會失敗）
         threads_tab = None
@@ -627,6 +628,7 @@ async def run_workflow(source: int):
         platforms = [
             ("facebook", caption_data["fb"], post_facebook),
             ("threads", caption_data["threads"], post_threads),
+            ("instagram", caption_data["ig"], post_ig_human),
         ]
 
         for platform_name, text, post_fn in platforms:
