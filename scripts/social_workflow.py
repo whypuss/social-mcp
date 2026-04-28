@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 CDP_PORT = 9333
 OUTPUT_DIR = Path.home() / ".hermes/cron/output"
 MAX_POSTED = 12
+GLOBAL_BLACKLIST_FILE = OUTPUT_DIR / "posted_topics_global.json"
 
 SOURCES = {
     "gtrends_hk": {
@@ -57,7 +58,7 @@ SOURCES = {
     },
     "gtrends_us": {
         "name": "Google Trends 美國",
-        "url": "https://trends.google.com.tw/trending?geo=US&pli=1",
+        "url": "https://trends.google.com/trending?geo=US",
         "row_selector": "tr.enOdEe-wZVHld-xMbwt",
         "posted_file": OUTPUT_DIR / "posted_topics_gtrends_us.json",
     },
@@ -68,7 +69,7 @@ SOURCES = {
 # CDP helpers
 # ============================================================================
 
-def _get_cdp_browser(port=9333):
+def _get_cdp_browser(port=9223):
     import urllib.request
     for p in [port, 9222]:
         try:
@@ -87,6 +88,30 @@ def _get_cdp_browser(port=9333):
 # ============================================================================
 # 防重複：per-source posted_topics 管理
 # ============================================================================
+
+def load_global_blacklist() -> set:
+    if not GLOBAL_BLACKLIST_FILE.exists():
+        return set()
+    try:
+        with open(GLOBAL_BLACKLIST_FILE, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+            return set(data) if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def add_to_global_blacklist(topic: str):
+    """任何來源 post 的 topic，都寫入全局黑名單"""
+    blacklist = list(load_global_blacklist())
+    if topic not in blacklist:
+        blacklist.append(topic)
+        # 保留最近 200 條
+        blacklist = blacklist[-200:]
+        GLOBAL_BLACKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(GLOBAL_BLACKLIST_FILE, "w", encoding="utf-8") as fp:
+            json.dump(blacklist, fp, ensure_ascii=False, indent=2)
+
+
 
 def load_posted_topics(source: str) -> list:
     f = SOURCES[source]["posted_file"]
@@ -113,6 +138,7 @@ def add_posted_topic(source: str, topic: str):
     topics = [t for t in topics if t != topic]
     topics.append(topic)
     save_posted_topics(source, topics)
+    add_to_global_blacklist(topic)
 
 
 # ============================================================================
@@ -124,6 +150,10 @@ ABSTRACT_KEYWORDS = [
     "2000", "2001", "2002", "2003", "2004",
     "series", "episode", "ep1", "ep2", "trailer",
     "awards", "fans", "fammeet",
+    # 人物黑名單（不發政治/爭議/無意義重複人物）
+    "曾志偉", "Eric Tsang", "尹馨",
+    # 香港娛樂重複人物
+    "華為", "Samsung",
 ]
 
 
@@ -215,6 +245,7 @@ def _clean_topics(topics_raw: list, skip_topics: list) -> list:
     cleaned = []
     seen = set()
     skip_set = set(skip_topics)
+    global_blacklist = load_global_blacklist()
     for t in topics_raw:
         t_clean = re.sub(r'\s+', '', t).strip()
         if not t_clean or t_clean in seen:
@@ -223,7 +254,9 @@ def _clean_topics(topics_raw: list, skip_topics: list) -> list:
         lower = t_clean.lower()
         if t_clean in skip_set:
             continue
-        if any(kw in lower for kw in ABSTRACT_KEYWORDS if len(kw) > 3):
+        if t_clean in global_blacklist:
+            continue
+        if any(kw in lower for kw in ABSTRACT_KEYWORDS if len(kw) > 2):
             continue
         cleaned.append(t_clean)
     return cleaned[:12]
@@ -448,7 +481,7 @@ async def run_workflow(source: str):
     async with async_playwright() as p:
         port, _ = _get_cdp_browser()
         browser = await p.chromium.connect_over_cdp(
-            f"http://localhost:{port or 9333}", timeout=20000
+            f"http://localhost:{port or 9333}", timeout=60000
         )
         ctx = browser.contexts[0]
 

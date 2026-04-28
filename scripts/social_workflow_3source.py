@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 log = logging.getLogger(__name__)
 
-CDP_PORT = 9333
+CDP_PORT = 9222  # 平常的 Chrome（有 Google 登入，不會 captcha）
 POSTED_TOPICS_FILE = Path.home() / ".hermes/cron/output/posted_topics_3source.json"
 MAX_POSTED = 30  # 30 個足够 36 小時（每 45 分鐘一個）
 
@@ -288,57 +288,67 @@ async def fetch_gtrends_us(ctx, skip_topics: list) -> list:
 # ============================================================================
 
 async def search_google_image(ctx, topic: str) -> str:
+    """用 Bing Images 搜尋 topic，回傳圖片路徑（Google 已被 captcha 封鎖，改用 Bing）"""
     search_q = urllib.parse.quote(topic[:50])
 
-    g_page = None
+    b_page = None
     for pg in ctx.pages:
-        if "google.com" in pg.url.lower() and "tbm=isch" not in pg.url.lower():
-            g_page = pg
+        if "bing.com" in pg.url.lower() and "/images/" in pg.url.lower():
+            b_page = pg
             break
-    if not g_page:
-        g_page = await ctx.new_page()
+    if not b_page:
+        b_page = await ctx.new_page()
 
-    await g_page.bring_to_front()
-    await g_page.goto(
-        f"https://www.google.com/search?q={search_q}&tbm=isch&hl=zh-TW",
+    await b_page.bring_to_front()
+    await b_page.goto(
+        f"https://www.bing.com/images/search?q={search_q}&first=1&cw=1280&ch=720",
         wait_until="domcontentloaded", timeout=30000
     )
     await asyncio.sleep(3)
 
-    imgs = await g_page.evaluate("""() => {
-        const all = Array.from(document.querySelectorAll('img'));
-        return all
-            .filter(img => {
-                const w = img.naturalWidth || img.width;
-                const h = img.naturalHeight || img.height;
-                return w > 100 && h > 80
-                    && !img.src.includes('gstatic.com')
-                    && !img.src.includes('google.com')
-                    && !img.src.includes('favicon');
-            })
-            .slice(0, 8)
-            .map(img => ({
-                src: img.src,
-                w: img.naturalWidth || img.width,
-                h: img.naturalHeight || img.height
-            }));
+    # Bing 的圖片 URL 在 link 的 mediaurl 參數裡
+    media_urls = await b_page.evaluate("""() => {
+        const links = Array.from(document.querySelectorAll('a[href*="mediaurl"]'));
+        const urls = [];
+        for (const link of links) {
+            const href = link.href;
+            try {
+                const params = new URLSearchParams(href.split('?')[1] || '');
+                const mediaUrl = params.get('mediaurl');
+                if (mediaUrl && mediaUrl.startsWith('http')) {
+                    // 解碼 URL
+                    const decoded = decodeURIComponent(mediaUrl);
+                    urls.push(decoded);
+                }
+            } catch(e) {}
+            if (urls.length >= 8) break;
+        }
+        return urls;
     }""")
 
-    for img in imgs:
-        src = img["src"]
-        if src.startswith("data:image/") and "," in src:
-            try:
-                b64_data = src.split(",", 1)[1]
-                img_bytes = base64.b64decode(b64_data)
-                if len(img_bytes) > 5000:
-                    out_path = f"/tmp/social3_{int(time.time())}_{random.randint(100,999)}.jpg"
-                    with open(out_path, "wb") as f:
-                        f.write(img_bytes)
-                    log.info(f"[Images] 存檔 {len(img_bytes)} bytes: {out_path}")
-                    return out_path
-            except Exception as e:
-                log.warning(f"[Images] 解碼失敗: {e}")
-                continue
+    log.info(f"[Images] Bing 找到 {len(media_urls)} 個 URL: {media_urls[:2]}")
+
+    for img_url in media_urls:
+        try:
+            # 直接下載圖片
+            async with b_page.context.request.get(img_url, timeout=15) as resp:
+                if resp.status == 200:
+                    content_type = resp.headers.get("content-type", "")
+                    ext = "jpg"
+                    if "webp" in content_type.lower():
+                        ext = "webp"
+                    elif "png" in content_type.lower():
+                        ext = "png"
+                    img_bytes = await resp.body()
+                    if len(img_bytes) > 5000:
+                        out_path = f"/tmp/social3_{int(time.time())}_{random.randint(100,999)}.{ext}"
+                        with open(out_path, "wb") as f:
+                            f.write(img_bytes)
+                        log.info(f"[Images] 下載成功 {len(img_bytes)} bytes: {out_path}")
+                        return out_path
+        except Exception as e:
+            log.warning(f"[Images] 下載失敗 {img_url[:60]}: {e}")
+            continue
 
     log.warning(f"[Images] 找不到圖片: '{topic}'")
     return None
